@@ -1,0 +1,56 @@
+# Nudge Coach API - Docker Compose
+# Run with: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # Main API Service
+  nudge-api:
+    build: .
+    container_name: nudge-api
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-groq}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.1-8b-instant}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nvidia/NV-Embed-v2}
+      - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
+      - CHROMA_PERSIST_DIR=/app/chroma_db
+      - REDIS_URL=redis://redis:6379
+      - MEMORY_TOP_K=${MEMORY_TOP_K:-8}
+      - MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}
+      - TEMPERATURE=${TEMPERATURE:-0.7}
+    volumes:
+      - chroma_data:/app/chroma_db
+      - ./nudge-lora-adapter:/app/nudge-lora-adapter:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for recent message cache
+  redis:
+    image: redis:7-alpine
+    container_name: nudge-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  chroma_data:
+    driver: local
+  redis_data:
+    driver: local
+

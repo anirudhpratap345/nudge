@@ -1,0 +1,32 @@
+# Nudge Coach API Dependencies
+
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# LLM Providers
+groq==0.4.2
+
+# For local/self-hosted model (optional)
+# Uncomment if using LLM_PROVIDER=local
+# torch>=2.0.0
+# transformers>=4.36.0
+# peft>=0.7.0
+# bitsandbytes>=0.41.0
+# accelerate>=0.25.0
+
+# Memory & Embeddings (Windows-friendly - no C++ build required)
+faiss-cpu>=1.8.0  # Pre-built wheels for Windows
+sentence-transformers>=5.0.0  # Updated for huggingface_hub compatibility
+redis==5.0.1
+numpy>=1.24.0
+
+# Utilities
+python-dotenv==1.0.0
+httpx==0.26.0
+
+# For NV-Embed-v2 (if using full model)
+# einops>=0.7.0
+
