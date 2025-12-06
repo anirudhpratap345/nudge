@@ -17,8 +17,21 @@ from models import (
     StoreMemoryRequest, MemoryEntry,
     UserProfile, HealthResponse
 )
-from memory import get_memory_manager, MemoryManager
-from llm import get_llm, BaseLLM
+
+# Lazy imports to avoid slow startup
+def get_memory_manager():
+    from memory import get_memory_manager as _get_memory_manager
+    return _get_memory_manager()
+
+def get_llm():
+    from llm import get_llm as _get_llm
+    return _get_llm()
+
+# Type hints for dependency injection
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from memory import MemoryManager
+    from llm import BaseLLM
 
 # Setup logging
 logging.basicConfig(
@@ -35,14 +48,8 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting Nudge Coach API...")
     settings = get_settings()
     logger.info(f"   LLM Provider: {settings.llm_provider}")
-    logger.info(f"   Memory: ChromaDB at {settings.chroma_persist_dir}")
-    
-    # Pre-warm the memory manager (loads embedding model)
-    try:
-        memory = get_memory_manager()
-        logger.info("   Memory manager initialized")
-    except Exception as e:
-        logger.warning(f"   Memory manager initialization delayed: {e}")
+    logger.info(f"   Embedding Model: {settings.embedding_model}")
+    logger.info(f"   Memory will be initialized on first request (lazy loading)")
     
     yield
     
@@ -88,8 +95,8 @@ app.add_middleware(
 @app.post("/api/v1/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(
     request: ChatRequest,
-    memory: MemoryManager = Depends(get_memory_manager),
-    llm: BaseLLM = Depends(get_llm)
+    memory = Depends(get_memory_manager),
+    llm = Depends(get_llm)
 ):
     """
     The main chat endpoint - this is where the magic happens.
@@ -176,7 +183,7 @@ async def chat(
 @app.post("/api/v1/memory", tags=["Memory"])
 async def store_memory(
     request: StoreMemoryRequest,
-    memory: MemoryManager = Depends(get_memory_manager)
+    memory = Depends(get_memory_manager)
 ):
     """
     Manually store a memory for a user.
@@ -211,7 +218,7 @@ async def get_user_memories(
     user_id: str,
     query: str = None,
     limit: int = 10,
-    memory: MemoryManager = Depends(get_memory_manager)
+    memory = Depends(get_memory_manager)
 ):
     """
     Retrieve memories for a user.
@@ -248,7 +255,7 @@ async def get_user_memories(
 @app.get("/api/v1/memory/{user_id}/stats", tags=["Memory"])
 async def get_user_stats(
     user_id: str,
-    memory: MemoryManager = Depends(get_memory_manager)
+    memory = Depends(get_memory_manager)
 ):
     """Get statistics about a user's stored memories."""
     try:
@@ -262,7 +269,7 @@ async def get_user_stats(
 @app.delete("/api/v1/memory/{user_id}", tags=["Memory"])
 async def delete_user_memories(
     user_id: str,
-    memory: MemoryManager = Depends(get_memory_manager)
+    memory = Depends(get_memory_manager)
 ):
     """
     Delete all memories for a user (GDPR compliance).
@@ -288,17 +295,11 @@ async def health_check():
     """Health check endpoint."""
     settings = get_settings()
     
-    # Check memory status
-    try:
-        memory = get_memory_manager()
-        memory_status = "healthy"
-    except Exception:
-        memory_status = "unavailable"
-    
+    # Don't load memory on health check to keep it fast
     return HealthResponse(
         status="healthy",
         llm_provider=settings.llm_provider,
-        memory_status=memory_status
+        memory_status="lazy_load"
     )
 
 
@@ -333,6 +334,6 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True
+        reload=False  # Disable reload for stability
     )
 
