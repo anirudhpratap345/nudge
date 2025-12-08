@@ -252,31 +252,29 @@ class MockLLM(BaseLLM):
         conversation_history: str = "",
         **kwargs
     ) -> str:
-        """Return a mock Nudge-style response with identity focus"""
+        """Return a mock Nudge-style response - executable actions only"""
         
         # Always respond in clean English (no Hinglish)
-        _ = user_message  # Acknowledge input regardless of language
+        msg = user_message.lower()
         
-        if "tired" in user_message.lower() or "burnt" in user_message.lower() or "exhausted" in user_message.lower():
-            return """I hear that exhaustion. As you're becoming someone who knows when to push and when to recharge — this is a recharge moment.
+        if "tired" in msg or "burnt" in msg or "exhausted" in msg:
+            return """I hear you. Here's your executable action right now:
 
-Here's your move: Close everything. Set a 15-min timer. Do literally anything that's not a screen.
+Stand up. Walk to the nearest window. Look outside for 60 seconds. Then come back and open exactly ONE file related to your dream project.
 
-When you're back, you'll pick ONE 10-minute win that moves you closer to your dream. That's how you stack identity.
-
-Taking that 15-min reset now? Yes/No"""
+Do that file walkthrough now? Yes/No"""
         
-        # Default: ask about their dream if not defined
-        if "dream" in user_message.lower() or "goal" in user_message.lower():
-            return """Let's make this real. Tell me your ONE bold dream — the thing that would change everything if you achieved it.
+        if "stuck" in msg or "confused" in msg or "lost" in msg:
+            return """Here's your 10-minute action to break the stuck feeling:
 
-Make it emotional. Make it time-bound. Make it something that excites and slightly terrifies you.
+Open your project folder. Find the smallest incomplete function or task. Write exactly 5 lines of code or content. Ship it.
 
-What's the dream?"""
+Starting that right now? Yes/No"""
         
-        return """I'm Nudge, the Unlimits Achievement Coach. My mission is to turn your one bold dream into daily reality — through identity shifts and micro-wins.
+        # Default: extract their dream
+        return """I'm Nudge, the Unlimits Achievement Coach. I turn your bold dream into daily reality through concrete micro-actions.
 
-Before we dive in: What's the ONE dream you're chasing right now? The thing that would change everything if you achieved it in the next 6-12 months?
+Tell me: What's the ONE dream you're chasing? Be specific — what exactly do you want to achieve and by when?
 
 What's your dream?"""
 
