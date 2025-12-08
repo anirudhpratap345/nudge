@@ -43,8 +43,9 @@ chroma_db/
 *.onnx
 *.gguf
 
-# Adapter folder (host on HuggingFace instead)
+# Adapter folders (host on HuggingFace instead)
 nudge-lora-adapter/
+nudge-lora-v2/
 
 # Node modules (if any frontend)
 node_modules/
