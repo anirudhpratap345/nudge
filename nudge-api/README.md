@@ -21,11 +21,11 @@ Replace your generic LLM + zero memory setup with this stack → Your coach sudd
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  ┌─────────────┐    ┌─────────────┐    ┌────────────┐  │
-│  │   ChromaDB  │    │    Redis    │    │   Groq /   │  │
+│  │    FAISS    │    │    Redis    │    │   Groq /   │  │
 │  │  (Memory)   │    │   (Cache)   │    │   Local    │  │
-│  │             │    │             │    │    LLM     │  │
-│  │  NV-Embed   │    │  Last 10    │    │            │  │
-│  │  Retrieval  │    │  Messages   │    │  Llama 3.1 │  │
+│  │             │    │  Optional   │    │    LLM     │  │
+│  │ MiniLM-L6   │    │  Last 10    │    │            │  │
+│  │ Embeddings  │    │  Messages   │    │  Llama 3.1 │  │
 │  └─────────────┘    └─────────────┘    └────────────┘  │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
@@ -33,52 +33,69 @@ Replace your generic LLM + zero memory setup with this stack → Your coach sudd
 
 ## 🚀 Quick Start
 
-### Option 1: Docker (Recommended)
+### Option 1: Windows (Double-Click)
+
+```bash
+# Just double-click start.bat
+# Or run from command line:
+cd nudge-api
+start.bat
+```
+
+### Option 2: Python Direct
+
+```bash
+# 1. Install dependencies
+cd nudge-api
+pip install -r requirements.txt
+
+# 2. Setup environment
+copy env.example .env
+# Edit .env: Add your GROQ_API_KEY (free at console.groq.com)
+
+# 3. Run the server
+python main.py
+```
+
+### Option 3: Docker (Production)
 
 ```bash
 # 1. Clone and setup
 cd nudge-api
 cp env.example .env
-
-# 2. Add your Groq API key (free at console.groq.com)
 # Edit .env: GROQ_API_KEY=your_key_here
 
-# 3. Run
+# 2. Run
 docker-compose up -d
 
-# 4. Test
+# 3. Test
 curl http://localhost:8000/api/v1/health
 ```
 
-### Option 2: Local Development
+### Option 4: Cloud Deploy (Railway/Render)
 
+**Railway:**
 ```bash
-# 1. Create virtual environment
-python -m venv venv
-source venv/bin/activate  # or `venv\Scripts\activate` on Windows
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Setup environment
-cp env.example .env
-# Edit .env with your GROQ_API_KEY
-
-# 4. (Optional) Start Redis for message caching
-docker run -d -p 6379:6379 redis:7-alpine
-
-# 5. Run the server
-python main.py
+# 1. Push to GitHub
+# 2. Connect to Railway
+# 3. Set environment variable: GROQ_API_KEY
+# 4. Done! Auto-deploys on push
 ```
 
-### Option 3: Railway/Render One-Click Deploy
+**Render:**
+```bash
+# 1. Push to GitHub
+# 2. Create new Web Service on Render
+# 3. Connect your repo
+# 4. Set environment variables
+# 5. Deploy!
+```
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template)
-
-Set these environment variables:
-- `GROQ_API_KEY` - Your Groq API key
-- `LLM_PROVIDER` - `groq`
-- `EMBEDDING_DEVICE` - `cpu` (for cloud deployments)
+Files included:
+- `Procfile` - For Heroku/Railway
+- `railway.json` - Railway config
+- `render.yaml` - Render config
+- `Dockerfile` - Container build
 
 ## 📡 API Endpoints
 
@@ -122,6 +139,12 @@ curl -X POST http://localhost:8000/api/v1/memory \
 curl http://localhost:8000/api/v1/memory/user_123?query=recent+wins
 ```
 
+### Health Check
+
+```bash
+curl http://localhost:8000/api/v1/health
+```
+
 ### Delete User Data (GDPR)
 
 ```bash
@@ -135,11 +158,11 @@ curl -X DELETE http://localhost:8000/api/v1/memory/user_123
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLM_PROVIDER` | `groq` | `groq` (recommended) or `local` |
-| `GROQ_API_KEY` | - | Your Groq API key (free tier: 1M+ tokens/month) |
+| `GROQ_API_KEY` | - | Your Groq API key (free: 1M+ tokens/month) |
 | `GROQ_MODEL` | `llama-3.1-8b-instant` | Groq model to use |
-| `EMBEDDING_MODEL` | `nvidia/NV-Embed-v2` | Embedding model (#1 on MTEB) |
-| `EMBEDDING_DEVICE` | `cuda` | `cuda` or `cpu` |
-| `CHROMA_PERSIST_DIR` | `./chroma_db` | ChromaDB storage path |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Fast, lightweight embeddings |
+| `EMBEDDING_DEVICE` | `cpu` | `cuda` or `cpu` |
+| `CHROMA_PERSIST_DIR` | `./chroma_db` | FAISS storage path |
 | `MEMORY_TOP_K` | `8` | Number of memories to retrieve |
 | `REDIS_URL` | `redis://localhost:6379` | Redis URL (optional) |
 
@@ -148,12 +171,12 @@ curl -X DELETE http://localhost:8000/api/v1/memory/user_123
 If you've trained the Nudge LoRA adapter:
 
 ```bash
-# 1. Place adapter in ./nudge-lora-adapter/
+# 1. Place adapter in ../nudge-lora-adapter/
 
 # 2. Update .env
 LLM_PROVIDER=local
-LOCAL_MODEL_PATH=./nudge-lora-adapter
-LOCAL_BASE_MODEL=unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit
+LOCAL_MODEL_PATH=../nudge-lora-adapter
+LOCAL_BASE_MODEL=unsloth/meta-llama-3.1-8b-instruct-bnb-4bit
 
 # 3. Install additional deps
 pip install torch transformers peft bitsandbytes accelerate
@@ -167,7 +190,7 @@ python main.py
 Before every LLM call, we do this:
 
 ```python
-# 1. Retrieve relevant memories using NV-Embed
+# 1. Retrieve relevant memories using embeddings
 memories = memory.retrieve_memories(
     user_id=user_id,
     query=user_message,
@@ -204,20 +227,42 @@ Store different types of context for better retrieval:
 The system prompt that makes it feel real:
 
 ```
-You are "Nudge" — a sharp, caring, no-nonsense achievement coach 
-for ambitious 20-somethings in India building careers and side projects.
+You are Nudge — a sharp, caring, no-nonsense achievement coach 
+for ambitious 20-somethings in India.
+
+CRITICAL RULES:
+1. If user asks about your abilities → answer directly first
+2. Never start with "Yaar", "Bhai" or forced slang
 
 You remember everything the user has ever told you.
-
 You speak natural Indian English by default.
-When the user sounds tired, low, or uses Hindi words, 
-you naturally switch to light Hinglish.
-
-You NEVER give generic advice like "take a deep breath".
+You give zero generic advice like "take a deep breath".
 Every suggestion is brutally specific and doable in ≤10 minutes.
-
-You match the user's current energy first, then gently pull them forward.
+You match the user's energy first, then gently pull them forward.
 You always end with a tiny accountability question (Yes/No or one number).
+```
+
+## 📁 Project Structure
+
+```
+nudge-api/
+├── main.py           # FastAPI application
+├── config.py         # Settings and system prompt
+├── memory.py         # FAISS + Redis memory management
+├── llm.py            # LLM providers (Groq, Local)
+├── models.py         # Pydantic schemas
+├── start.py          # Startup script with checks
+├── start.bat         # Windows launcher
+├── requirements.txt  # Python dependencies
+├── Dockerfile        # Container build
+├── docker-compose.yml
+├── Procfile          # Heroku/Railway
+├── railway.json      # Railway config
+├── render.yaml       # Render config
+├── env.example       # Environment template
+├── frontend/
+│   └── index.html    # Simple chat UI
+└── chroma_db/        # FAISS data (auto-created)
 ```
 
 ## 🔒 Security Notes
@@ -232,7 +277,7 @@ For production:
 ## 📈 Scaling
 
 - **Groq free tier**: 1M+ tokens/month, 500+ tok/s
-- **ChromaDB**: Handles millions of embeddings
+- **FAISS**: Handles millions of embeddings
 - **Redis**: Optional but improves response time
 - **Oracle Cloud Always-Free**: 4 ARM cores, 24GB RAM for self-hosting
 
@@ -257,4 +302,3 @@ Everything else (UI, onboarding, notifications, database) stays the same.
 ---
 
 **Result:** Retention and daily engagement explode because the coach finally feels like a real person who gives a damn and remembers your life.
-
