@@ -199,9 +199,38 @@ class FAISSMemoryStore:
         return sum(1 for m in self._metadata if m.get('user_id') == user_id)
 
 
+class InMemoryCache:
+    """Simple in-memory cache when Redis is not available"""
+    
+    def __init__(self, max_messages: int = 10):
+        self.max_messages = max_messages
+        self._cache: Dict[str, List[Dict[str, str]]] = {}
+    
+    def add_message(self, user_id: str, role: str, content: str):
+        if user_id not in self._cache:
+            self._cache[user_id] = []
+        
+        self._cache[user_id].append({
+            "role": role,
+            "content": content,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        # Keep only last N messages
+        if len(self._cache[user_id]) > self.max_messages:
+            self._cache[user_id] = self._cache[user_id][-self.max_messages:]
+    
+    def get_messages(self, user_id: str) -> List[Dict[str, str]]:
+        return self._cache.get(user_id, [])
+    
+    def clear_user(self, user_id: str):
+        if user_id in self._cache:
+            del self._cache[user_id]
+
+
 class MemoryManager:
     """
-    Manages long-term memory (FAISS) and short-term cache (Redis)
+    Manages long-term memory (FAISS) and short-term cache (Redis or in-memory)
     """
     
     def __init__(self):
@@ -209,6 +238,8 @@ class MemoryManager:
         self._embed_model = None
         self._faiss_store = None
         self._redis_client = None
+        self._use_memory_cache = False
+        self._memory_cache = InMemoryCache(max_messages=self.settings.redis_cache_size)
     
     @property
     def embed_model(self) -> EmbeddingModel:
@@ -233,17 +264,29 @@ class MemoryManager:
     @property
     def redis_client(self) -> Optional[redis.Redis]:
         """Get Redis client for recent message cache"""
-        if self._redis_client is None:
+        if self._redis_client is None and self.settings.redis_enabled:
             try:
-                self._redis_client = redis.from_url(
-                    self.settings.redis_url,
-                    decode_responses=True
-                )
+                # Support both local Redis and Upstash (cloud)
+                if self.settings.redis_ssl or "upstash" in self.settings.redis_url.lower():
+                    # Upstash requires SSL
+                    self._redis_client = redis.from_url(
+                        self.settings.redis_url,
+                        decode_responses=True,
+                        ssl_cert_reqs=None  # Skip cert verification for Upstash
+                    )
+                else:
+                    # Local Redis/Memurai
+                    self._redis_client = redis.from_url(
+                        self.settings.redis_url,
+                        decode_responses=True,
+                        password=self.settings.redis_password
+                    )
                 self._redis_client.ping()
                 logger.info("✅ Redis connected")
             except Exception as e:
                 logger.warning(f"Redis connection failed: {e}. Using in-memory fallback.")
                 self._redis_client = None
+                self._use_memory_cache = True
         return self._redis_client
     
     def store_memory(
@@ -365,37 +408,49 @@ class MemoryManager:
         return "\n".join(memory_lines)
     
     # =========================================
-    # Redis Cache for Recent Messages
+    # Message Cache (Redis or In-Memory)
     # =========================================
     
     def cache_message(self, user_id: str, role: str, content: str):
-        """Cache a message in Redis for quick access"""
-        if not self.redis_client:
-            return
+        """Cache a message for quick access (Redis or in-memory fallback)"""
+        # Try Redis first
+        if self.redis_client:
+            try:
+                key = f"nudge:history:{user_id}"
+                message = json.dumps({
+                    "role": role,
+                    "content": content,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                
+                # Add to list and trim to last N messages
+                self.redis_client.rpush(key, message)
+                self.redis_client.ltrim(key, -self.settings.redis_cache_size, -1)
+                
+                # Set expiry (7 days)
+                self.redis_client.expire(key, 60 * 60 * 24 * 7)
+                return
+            except Exception as e:
+                logger.warning(f"Redis cache_message failed: {e}")
+                self._use_memory_cache = True
         
-        key = f"nudge:history:{user_id}"
-        message = json.dumps({
-            "role": role,
-            "content": content,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        
-        # Add to list and trim to last N messages
-        self.redis_client.rpush(key, message)
-        self.redis_client.ltrim(key, -self.settings.redis_cache_size, -1)
-        
-        # Set expiry (7 days)
-        self.redis_client.expire(key, 60 * 60 * 24 * 7)
+        # Fallback to in-memory cache
+        self._memory_cache.add_message(user_id, role, content)
     
     def get_recent_messages(self, user_id: str) -> List[Dict[str, str]]:
-        """Get recent messages from Redis cache"""
-        if not self.redis_client:
-            return []
+        """Get recent messages from cache (Redis or in-memory fallback)"""
+        # Try Redis first
+        if self.redis_client and not self._use_memory_cache:
+            try:
+                key = f"nudge:history:{user_id}"
+                messages = self.redis_client.lrange(key, 0, -1)
+                return [json.loads(msg) for msg in messages]
+            except Exception as e:
+                logger.warning(f"Redis get_recent_messages failed: {e}")
+                self._use_memory_cache = True
         
-        key = f"nudge:history:{user_id}"
-        messages = self.redis_client.lrange(key, 0, -1)
-        
-        return [json.loads(msg) for msg in messages]
+        # Fallback to in-memory cache
+        return self._memory_cache.get_messages(user_id)
     
     def format_conversation_history(self, messages: List[Dict[str, str]]) -> str:
         """Format conversation history for the prompt"""
@@ -438,9 +493,15 @@ class MemoryManager:
         """Delete all memories for a user (GDPR compliance)"""
         count = self.faiss_store.delete_by_user(user_id)
         
-        # Also clear Redis cache
+        # Clear Redis cache
         if self.redis_client:
-            self.redis_client.delete(f"nudge:history:{user_id}")
+            try:
+                self.redis_client.delete(f"nudge:history:{user_id}")
+            except Exception as e:
+                logger.warning(f"Redis delete failed: {e}")
+        
+        # Also clear in-memory cache
+        self._memory_cache.clear_user(user_id)
         
         return count
 

@@ -35,18 +35,23 @@ class BaseLLM(ABC):
         Build the full prompt with memory injection
         
         This is the core of the strategy:
-        - Inject long-term memory from ChromaDB
+        - Inject long-term memory into system prompt
         - Include recent conversation history
-        - Use the Nudge system prompt
+        - Use the Nudge system prompt with identity shifting
         """
         today_date = datetime.now().strftime("%A, %B %d, %Y")
         
-        # Build the full prompt
-        prompt_parts = []
+        # Format memory context for the prompt
+        memory_text = memory_context if memory_context else "(No memories yet - this is a new user)"
         
-        # Add memory context if available
-        if memory_context:
-            prompt_parts.append(f"LONG TERM MEMORY (things you remember about this user):\n{memory_context}")
+        # Build system prompt with placeholders filled
+        system_prompt = NUDGE_SYSTEM_PROMPT.format(
+            today_date=today_date,
+            memory_context=memory_text
+        )
+        
+        # Build user context
+        prompt_parts = []
         
         # Add conversation history if available
         if conversation_history:
@@ -57,9 +62,6 @@ class BaseLLM(ABC):
         
         # Join all parts
         full_context = "\n\n".join(prompt_parts)
-        
-        # Add date to system prompt
-        system_prompt = NUDGE_SYSTEM_PROMPT + f"\n\nToday is {today_date} IST."
         
         return system_prompt, full_context
 
@@ -241,7 +243,7 @@ class LocalLLM(BaseLLM):
 
 
 class MockLLM(BaseLLM):
-    """Mock LLM for testing without API keys"""
+    """Mock LLM for testing without API keys - Unlimits style"""
     
     def generate(
         self,
@@ -250,37 +252,33 @@ class MockLLM(BaseLLM):
         conversation_history: str = "",
         **kwargs
     ) -> str:
-        """Return a mock Nudge-style response"""
+        """Return a mock Nudge-style response with identity focus"""
         
-        # Check for Hinglish trigger
-        hinglish_triggers = ["yaar", "bhai", "kya", "hai", "nahi", "kuch"]
-        is_hinglish = any(trigger in user_message.lower() for trigger in hinglish_triggers)
-        
-        if is_hinglish:
-            return """Haan yaar, samajh raha hoon. Yeh phase tough lagta hai.
-
-Ek kaam kar: Abhi 5 minute ke liye sab kuch band kar. Ek deep breath le, aur mujhe bata - aaj ka ek small win kya ho sakta hai? Choti si cheez bhi chalegi.
-
-Small win batao?"""
+        # Always respond in clean English (no Hinglish)
+        _ = user_message  # Acknowledge input regardless of language
         
         if "tired" in user_message.lower() or "burnt" in user_message.lower() or "exhausted" in user_message.lower():
-            return """Yeah, that exhaustion is real. You've been pushing hard.
+            return """I hear that exhaustion. As you're becoming someone who knows when to push and when to recharge — this is a recharge moment.
 
-Here's the thing - your brain needs a reset, not more grinding.
+Here's your move: Close everything. Set a 15-min timer. Do literally anything that's not a screen.
 
-Close everything right now. Set a timer for 20 minutes and do literally anything that's not a screen - walk, stretch, stare at the wall.
+When you're back, you'll pick ONE 10-minute win that moves you closer to your dream. That's how you stack identity.
 
-When you're back, pick ONE easy win to end the day on. Something you can finish in 10 minutes.
-
-Taking that 20-min break now? Yes/No"""
+Taking that 15-min reset now? Yes/No"""
         
-        return f"""I hear you. Let's figure this out.
+        # Default: ask about their dream if not defined
+        if "dream" in user_message.lower() or "goal" in user_message.lower():
+            return """Let's make this real. Tell me your ONE bold dream — the thing that would change everything if you achieved it.
 
-What's the ONE thing that would make today feel like a win? Not your whole todo list - just the one thing that matters most right now.
+Make it emotional. Make it time-bound. Make it something that excites and slightly terrifies you.
 
-Name it, and let's make sure it happens.
+What's the dream?"""
+        
+        return """I'm Nudge, the Unlimits Achievement Coach. My mission is to turn your one bold dream into daily reality — through identity shifts and micro-wins.
 
-What's your one thing?"""
+Before we dive in: What's the ONE dream you're chasing right now? The thing that would change everything if you achieved it in the next 6-12 months?
+
+What's your dream?"""
 
 
 # Factory function to get the appropriate LLM
