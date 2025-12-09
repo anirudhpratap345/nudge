@@ -1,11 +1,12 @@
 """
-Memory module: FAISS for vector search + Redis for recent messages
-Uses sentence-transformers for embeddings (NV-Embed or fallback)
+Memory module: FAISS for vector search + Redis for recent messages.
 
-FAISS has pre-built Windows wheels - no C++ build tools required!
+Vercel (Hobby) cannot build heavy deps like faiss-cpu/sentence-transformers
+within the 8 GB build box. To keep the API running on Groq-only deployments,
+we gracefully fall back to a lightweight in-memory store when FAISS/embeddings
+are not installed. Long-term vector memory will be disabled in that case, but
+the API and Groq chat will still work.
 """
-import faiss
-import numpy as np
 from typing import List, Optional, Dict, Any
 import json
 import os
@@ -13,190 +14,241 @@ import pickle
 from datetime import datetime
 import logging
 import redis
-from sentence_transformers import SentenceTransformer
 
 from config import get_settings
 
 logger = logging.getLogger(__name__)
 
-
-class EmbeddingModel:
-    """
-    Embedding function using sentence-transformers
-    Tries NV-Embed-v2 first, falls back to all-MiniLM-L6-v2
-    """
-    
-    def __init__(self, model_name: str = "nvidia/NV-Embed-v2", device: str = "cuda"):
-        self.model_name = model_name
-        self.device = device
-        self._model = None
-        self._dimension = None
-    
-    @property
-    def model(self):
-        """Lazy load the embedding model"""
-        if self._model is None:
-            logger.info(f"Loading embedding model: {self.model_name}")
-            try:
-                # Try the specified model first
-                self._model = SentenceTransformer(
-                    self.model_name,
-                    device=self.device,
-                    trust_remote_code=True
-                )
-                logger.info(f"✅ Loaded {self.model_name}")
-            except Exception as e:
-                # Fallback to a lighter model
-                logger.warning(f"Failed to load {self.model_name}: {e}")
-                logger.info("Falling back to all-MiniLM-L6-v2")
-                self._model = SentenceTransformer(
-                    "all-MiniLM-L6-v2",
-                    device="cpu"  # This small model runs fine on CPU
-                )
-        return self._model
-    
-    @property
-    def dimension(self) -> int:
-        """Get embedding dimension"""
-        if self._dimension is None:
-            # Encode a test sentence to get dimension
-            test_embedding = self.encode(["test"])
-            self._dimension = test_embedding.shape[1]
-        return self._dimension
-    
-    def encode(self, texts: List[str]) -> np.ndarray:
-        """Generate embeddings for a list of texts"""
-        embeddings = self.model.encode(texts, convert_to_numpy=True)
-        return embeddings.astype('float32')  # FAISS requires float32
+# Optional heavy deps ---------------------------------------------------------
+FAISS_AVAILABLE = True
+try:
+    import faiss
+    import numpy as np
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    FAISS_AVAILABLE = False
+    faiss = None  # type: ignore
+    np = None     # type: ignore
+    SentenceTransformer = None  # type: ignore
+    logger.warning(
+        "FAISS/sentence-transformers not installed. "
+        "Running in Groq-only mode with no vector memory."
+    )
 
 
-class FAISSMemoryStore:
-    """
-    FAISS-based vector store for long-term memories
-    Persists to disk for durability
-    """
-    
-    def __init__(self, persist_dir: str, dimension: int):
-        self.persist_dir = persist_dir
-        self.dimension = dimension
+if FAISS_AVAILABLE:
+    class EmbeddingModel:
+        """
+        Embedding function using sentence-transformers
+        Tries NV-Embed-v2 first, falls back to all-MiniLM-L6-v2
+        """
         
-        # Create persist directory
-        os.makedirs(persist_dir, exist_ok=True)
+        def __init__(self, model_name: str = "nvidia/NV-Embed-v2", device: str = "cuda"):
+            self.model_name = model_name
+            self.device = device
+            self._model = None
+            self._dimension = None
         
-        # File paths
-        self.index_path = os.path.join(persist_dir, "faiss.index")
-        self.metadata_path = os.path.join(persist_dir, "metadata.pkl")
+        @property
+        def model(self):
+            """Lazy load the embedding model"""
+            if self._model is None:
+                logger.info(f"Loading embedding model: {self.model_name}")
+                try:
+                    # Try the specified model first
+                    self._model = SentenceTransformer(
+                        self.model_name,
+                        device=self.device,
+                        trust_remote_code=True
+                    )
+                    logger.info(f"✅ Loaded {self.model_name}")
+                except Exception as e:
+                    # Fallback to a lighter model
+                    logger.warning(f"Failed to load {self.model_name}: {e}")
+                    logger.info("Falling back to all-MiniLM-L6-v2")
+                    self._model = SentenceTransformer(
+                        "all-MiniLM-L6-v2",
+                        device="cpu"  # This small model runs fine on CPU
+                    )
+            return self._model
         
-        # Initialize or load index
-        self._index = None
-        self._metadata: List[Dict[str, Any]] = []
-        self._load_or_create()
-    
-    def _load_or_create(self):
-        """Load existing index or create new one"""
-        if os.path.exists(self.index_path) and os.path.exists(self.metadata_path):
-            logger.info(f"Loading FAISS index from {self.persist_dir}")
-            self._index = faiss.read_index(self.index_path)
-            with open(self.metadata_path, 'rb') as f:
-                self._metadata = pickle.load(f)
-            logger.info(f"Loaded {self._index.ntotal} vectors")
-        else:
-            logger.info(f"Creating new FAISS index (dim={self.dimension})")
-            # Use IndexFlatIP for inner product (cosine similarity with normalized vectors)
-            self._index = faiss.IndexFlatIP(self.dimension)
-            self._metadata = []
-    
-    def _save(self):
-        """Persist index to disk"""
-        faiss.write_index(self._index, self.index_path)
-        with open(self.metadata_path, 'wb') as f:
-            pickle.dump(self._metadata, f)
-    
-    def add(self, embeddings: np.ndarray, metadata_list: List[Dict[str, Any]]):
-        """Add vectors with metadata"""
-        # Normalize for cosine similarity
-        faiss.normalize_L2(embeddings)
+        @property
+        def dimension(self) -> int:
+            """Get embedding dimension"""
+            if self._dimension is None:
+                # Encode a test sentence to get dimension
+                test_embedding = self.encode(["test"])
+                self._dimension = test_embedding.shape[1]
+            return self._dimension
         
-        # Add to index
-        self._index.add(embeddings)
-        self._metadata.extend(metadata_list)
+        def encode(self, texts: List[str]) -> np.ndarray:
+            """Generate embeddings for a list of texts"""
+            embeddings = self.model.encode(texts, convert_to_numpy=True)
+            return embeddings.astype('float32')  # FAISS requires float32
+
+
+    class FAISSMemoryStore:
+        """
+        FAISS-based vector store for long-term memories
+        Persists to disk for durability
+        """
         
-        # Persist
-        self._save()
-    
-    def search(
-        self,
-        query_embedding: np.ndarray,
-        k: int = 8,
-        filter_fn: Optional[callable] = None
-    ) -> List[Dict[str, Any]]:
-        """Search for similar vectors"""
-        if self._index.ntotal == 0:
-            return []
-        
-        # Normalize query
-        query_embedding = query_embedding.reshape(1, -1).astype('float32')
-        faiss.normalize_L2(query_embedding)
-        
-        # Search more than k if we need to filter
-        search_k = min(k * 3, self._index.ntotal) if filter_fn else min(k, self._index.ntotal)
-        
-        distances, indices = self._index.search(query_embedding, search_k)
-        
-        results = []
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx == -1:  # FAISS returns -1 for empty slots
-                continue
+        def __init__(self, persist_dir: str, dimension: int):
+            self.persist_dir = persist_dir
+            self.dimension = dimension
             
-            meta = self._metadata[idx].copy()
-            meta['score'] = float(dist)
+            # Create persist directory
+            os.makedirs(persist_dir, exist_ok=True)
             
-            # Apply filter if provided
-            if filter_fn and not filter_fn(meta):
-                continue
+            # File paths
+            self.index_path = os.path.join(persist_dir, "faiss.index")
+            self.metadata_path = os.path.join(persist_dir, "metadata.pkl")
             
-            results.append(meta)
-            
-            if len(results) >= k:
-                break
+            # Initialize or load index
+            self._index = None
+            self._metadata: List[Dict[str, Any]] = []
+            self._load_or_create()
         
-        return results
-    
-    def delete_by_user(self, user_id: str) -> int:
-        """Delete all vectors for a user (requires rebuilding index)"""
-        # Find indices to keep
-        keep_indices = []
-        keep_metadata = []
-        
-        for i, meta in enumerate(self._metadata):
-            if meta.get('user_id') != user_id:
-                keep_indices.append(i)
-                keep_metadata.append(meta)
-        
-        deleted_count = len(self._metadata) - len(keep_metadata)
-        
-        if deleted_count > 0:
-            # Rebuild index with remaining vectors
-            if keep_indices:
-                # Get vectors to keep
-                vectors = np.zeros((len(keep_indices), self.dimension), dtype='float32')
-                for new_idx, old_idx in enumerate(keep_indices):
-                    vectors[new_idx] = self._index.reconstruct(old_idx)
-                
-                # Create new index
-                self._index = faiss.IndexFlatIP(self.dimension)
-                self._index.add(vectors)
+        def _load_or_create(self):
+            """Load existing index or create new one"""
+            if os.path.exists(self.index_path) and os.path.exists(self.metadata_path):
+                logger.info(f"Loading FAISS index from {self.persist_dir}")
+                self._index = faiss.read_index(self.index_path)
+                with open(self.metadata_path, 'rb') as f:
+                    self._metadata = pickle.load(f)
+                logger.info(f"Loaded {self._index.ntotal} vectors")
             else:
+                logger.info(f"Creating new FAISS index (dim={self.dimension})")
+                # Use IndexFlatIP for inner product (cosine similarity with normalized vectors)
                 self._index = faiss.IndexFlatIP(self.dimension)
+                self._metadata = []
+        
+        def _save(self):
+            """Persist index to disk"""
+            faiss.write_index(self._index, self.index_path)
+            with open(self.metadata_path, 'wb') as f:
+                pickle.dump(self._metadata, f)
+        
+        def add(self, embeddings: np.ndarray, metadata_list: List[Dict[str, Any]]):
+            """Add vectors with metadata"""
+            # Normalize for cosine similarity
+            faiss.normalize_L2(embeddings)
             
-            self._metadata = keep_metadata
+            # Add to index
+            self._index.add(embeddings)
+            self._metadata.extend(metadata_list)
+            
+            # Persist
             self._save()
         
-        return deleted_count
-    
-    def get_user_count(self, user_id: str) -> int:
-        """Count memories for a user"""
-        return sum(1 for m in self._metadata if m.get('user_id') == user_id)
+        def search(
+            self,
+            query_embedding: np.ndarray,
+            k: int = 8,
+            filter_fn: Optional[callable] = None
+        ) -> List[Dict[str, Any]]:
+            """Search for similar vectors"""
+            if self._index.ntotal == 0:
+                return []
+            
+            # Normalize query
+            query_embedding = query_embedding.reshape(1, -1).astype('float32')
+            faiss.normalize_L2(query_embedding)
+            
+            # Search more than k if we need to filter
+            search_k = min(k * 3, self._index.ntotal) if filter_fn else min(k, self._index.ntotal)
+            
+            distances, indices = self._index.search(query_embedding, search_k)
+            
+            results = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx == -1:  # FAISS returns -1 for empty slots
+                    continue
+                
+                meta = self._metadata[idx].copy()
+                meta['score'] = float(dist)
+                
+                # Apply filter if provided
+                if filter_fn and not filter_fn(meta):
+                    continue
+                
+                results.append(meta)
+                
+                if len(results) >= k:
+                    break
+            
+            return results
+        
+        def delete_by_user(self, user_id: str) -> int:
+            """Delete all vectors for a user (requires rebuilding index)"""
+            # Find indices to keep
+            keep_indices = []
+            keep_metadata = []
+            
+            for i, meta in enumerate(self._metadata):
+                if meta.get('user_id') != user_id:
+                    keep_indices.append(i)
+                    keep_metadata.append(meta)
+            
+            deleted_count = len(self._metadata) - len(keep_metadata)
+            
+            if deleted_count > 0:
+                # Rebuild index with remaining vectors
+                if keep_indices:
+                    # Get vectors to keep
+                    vectors = np.zeros((len(keep_indices), self.dimension), dtype='float32')
+                    for new_idx, old_idx in enumerate(keep_indices):
+                        vectors[new_idx] = self._index.reconstruct(old_idx)
+                    
+                    # Create new index
+                    self._index = faiss.IndexFlatIP(self.dimension)
+                    self._index.add(vectors)
+                else:
+                    self._index = faiss.IndexFlatIP(self.dimension)
+                
+                self._metadata = keep_metadata
+                self._save()
+            
+            return deleted_count
+        
+        def get_user_count(self, user_id: str) -> int:
+            """Count memories for a user"""
+            return sum(1 for m in self._metadata if m.get('user_id') == user_id)
+else:
+    class EmbeddingModel:
+        """Lightweight stub when embeddings are not available."""
+        def __init__(self, *args, **kwargs):
+            self.model_name = "stub"
+            self.device = "cpu"
+            self._dimension = 0
+
+        @property
+        def dimension(self) -> int:
+            return 0
+
+        def encode(self, texts: List[str]):
+            return []
+
+
+    class FAISSMemoryStore:
+        """No-op vector store stub."""
+        def __init__(self, persist_dir: str, dimension: int):
+            self._metadata: List[Dict[str, Any]] = []
+
+        def add(self, embeddings, metadata_list: List[Dict[str, Any]]):
+            self._metadata.extend(metadata_list)
+
+        def search(self, query_embedding=None, k: int = 8, filter_fn: Optional[callable] = None) -> List[Dict[str, Any]]:
+            # Return nothing to avoid misleading context
+            return []
+
+        def delete_by_user(self, user_id: str) -> int:
+            before = len(self._metadata)
+            self._metadata = [m for m in self._metadata if m.get("user_id") != user_id]
+            return before - len(self._metadata)
+
+        def get_user_count(self, user_id: str) -> int:
+            return sum(1 for m in self._metadata if m.get('user_id') == user_id)
 
 
 class InMemoryCache:
@@ -240,6 +292,7 @@ class MemoryManager:
         self._redis_client = None
         self._use_memory_cache = False
         self._memory_cache = InMemoryCache(max_messages=self.settings.redis_cache_size)
+        self._fallback_memories: Dict[str, List[Dict[str, Any]]] = {}
     
     @property
     def embed_model(self) -> EmbeddingModel:
@@ -320,14 +373,21 @@ class MemoryManager:
             "timestamp": timestamp,
             **(metadata or {})
         }
-        
-        # Generate embedding
-        embedding = self.embed_model.encode([content])
-        
-        # Store in FAISS
-        self.faiss_store.add(embedding, [doc_metadata])
-        
-        logger.info(f"Stored memory {memory_id} for user {user_id}")
+        if FAISS_AVAILABLE:
+            # Generate embedding
+            embedding = self.embed_model.encode([content])
+            
+            # Store in FAISS
+            self.faiss_store.add(embedding, [doc_metadata])
+            
+            logger.info(f"Stored memory {memory_id} for user {user_id}")
+        else:
+            # Lightweight fallback: keep last N memories per user in-memory
+            self._fallback_memories.setdefault(user_id, [])
+            self._fallback_memories[user_id].append(doc_metadata)
+            # Keep it bounded
+            self._fallback_memories[user_id] = self._fallback_memories[user_id][-self.settings.memory_top_k :]
+            logger.info(f"Stored fallback memory {memory_id} for user {user_id}")
         return memory_id
     
     def retrieve_memories(
@@ -351,6 +411,21 @@ class MemoryManager:
             List of memory documents with metadata
         """
         n_results = n_results or self.settings.memory_top_k
+        # If FAISS is unavailable (Vercel slim build), return fallback memories
+        if not FAISS_AVAILABLE:
+            fallback = self._fallback_memories.get(user_id, [])
+            return [
+                {
+                    "content": mem.get("content", ""),
+                    "metadata": {
+                        "memory_type": mem.get("memory_type", "unknown"),
+                        "timestamp": mem.get("timestamp", ""),
+                        "user_id": mem.get("user_id", "")
+                    },
+                    "score": 0
+                }
+                for mem in fallback[-n_results:]
+            ]
         
         # Generate query embedding
         query_embedding = self.embed_model.encode([query])
@@ -471,6 +546,17 @@ class MemoryManager:
     
     def get_user_stats(self, user_id: str) -> Dict[str, Any]:
         """Get stats about a user's stored memories"""
+        if not FAISS_AVAILABLE:
+            user_mems = self._fallback_memories.get(user_id, [])
+            memory_types: Dict[str, int] = {}
+            for mem in user_mems:
+                mem_type = mem.get("memory_type", "unknown")
+                memory_types[mem_type] = memory_types.get(mem_type, 0) + 1
+            return {
+                "user_id": user_id,
+                "total_memories": len(user_mems),
+                "memory_types": memory_types
+            }
         # Get all memories for user to count types
         all_memories = self.faiss_store.search(
             self.embed_model.encode(["user memories"])[0],
@@ -491,7 +577,12 @@ class MemoryManager:
     
     def delete_user_memories(self, user_id: str) -> int:
         """Delete all memories for a user (GDPR compliance)"""
-        count = self.faiss_store.delete_by_user(user_id)
+        if not FAISS_AVAILABLE:
+            before = len(self._fallback_memories.get(user_id, []))
+            self._fallback_memories[user_id] = []
+            count = before
+        else:
+            count = self.faiss_store.delete_by_user(user_id)
         
         # Clear Redis cache
         if self.redis_client:

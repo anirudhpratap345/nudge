@@ -8,11 +8,8 @@ pydantic-settings==2.1.0
 # LLM Provider
 groq==0.4.2
 
-# Memory & Embeddings
-faiss-cpu>=1.8.0
-sentence-transformers>=5.0.0
+# Slim build for Vercel (Groq-only)
 redis==5.0.1
-numpy>=1.24.0
 
 # Utilities
 httpx==0.26.0
