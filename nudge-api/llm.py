@@ -112,9 +112,10 @@ class GroqLLM(BaseLLM):
             response = self.client.chat.completions.create(
                 model=self.settings.groq_model,
                 messages=messages,
-                max_tokens=self.settings.max_new_tokens,
-                temperature=self.settings.temperature,
-                top_p=self.settings.top_p,
+                temperature=0.05,  # Low for rule adherence
+                max_tokens=150,     # Short for snappiness
+                top_p=0.8,          # Balanced variety
+                repetition_penalty=1.2  # Kills loops
             )
             
             return response.choices[0].message.content

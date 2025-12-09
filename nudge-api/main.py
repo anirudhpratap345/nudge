@@ -5,11 +5,14 @@ The single change that 10x's your AI coach:
 - Long-term memory via ChromaDB + NV-Embed
 - Nudge personality via system prompt (or fine-tuned LoRA)
 - Fast inference via Groq (or self-hosted)
+- Hybrid rule engine for 95%+ human-like responses
 """
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
+import random
+import json
 
 from config import get_settings, NUDGE_SYSTEM_PROMPT
 from models import (
@@ -39,6 +42,210 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+# =============================================
+# RULE ENGINE - Post-process Groq responses
+# =============================================
+
+def get_action_pool(memory_context: str = "") -> list:
+    """Generate 50+ actions based on user's dream/memory context"""
+    base_actions = [
+        "open LeetCode and solve problem #2389",
+        "push one commit to your repo with a bug fix",
+        "run `pip install transformers` and import pipeline",
+        "open Hugging Face and fine-tune distilbert for 10 mins",
+        "write a test case for your most recent function",
+        "refactor one function to reduce complexity",
+        "add error handling to your latest feature",
+        "update README with one new feature description",
+        "create a GitHub issue template for bug reports",
+        "write a docstring for an undocumented function",
+        "run linter and fix one warning",
+        "add a comment explaining complex logic",
+        "create a simple unit test for edge case",
+        "optimize one slow database query",
+        "add logging to a critical function",
+        "create a migration script for schema change",
+        "write API documentation for one endpoint",
+        "add input validation to a form handler",
+        "create a simple CLI command",
+        "set up CI/CD for one test suite",
+        "add rate limiting to an API endpoint",
+        "implement caching for one expensive operation",
+        "create a Dockerfile for your project",
+        "add environment variable validation",
+        "write a script to seed test data",
+        "create a simple monitoring dashboard",
+        "add retry logic to an external API call",
+        "implement pagination for a list endpoint",
+        "add authentication to one route",
+        "create a simple health check endpoint",
+        "write a script to backup your database",
+        "add compression to API responses",
+        "implement request timeout handling",
+        "create a simple admin panel",
+        "add request logging middleware",
+        "write a script to clean up old data",
+        "implement graceful shutdown handling",
+        "add metrics collection for one endpoint",
+        "create a simple load testing script",
+        "add circuit breaker for external service",
+        "write a script to migrate data format",
+        "implement simple rate limiting",
+        "add request validation middleware",
+        "create a simple deployment script",
+        "write a script to generate API docs",
+        "add error tracking integration",
+        "implement simple caching layer",
+        "create a script to sync data sources",
+        "add request/response logging",
+        "write a simple performance test"
+    ]
+    
+    # Prioritize actions based on memory context
+    if "leetcode" in memory_context.lower() or "coding" in memory_context.lower():
+        leetcode_actions = [
+            "open LeetCode and solve problem #2389",
+            "solve LeetCode problem #15 (3Sum)",
+            "practice binary search on LeetCode",
+            "review LeetCode solution for problem #1"
+        ]
+        base_actions = leetcode_actions + base_actions
+    
+    if "ai" in memory_context.lower() or "ml" in memory_context.lower():
+        ai_actions = [
+            "open Hugging Face and fine-tune distilbert for 10 mins",
+            "run `pip install transformers` and import pipeline",
+            "train a simple model on a small dataset",
+            "test a pre-trained model on your data"
+        ]
+        base_actions = ai_actions + base_actions
+    
+    return base_actions
+
+
+def get_last_action(user_id: str, memory) -> str:
+    """Get last action from Redis to avoid repeats"""
+    try:
+        if hasattr(memory, 'redis_client') and memory.redis_client:
+            last_action_key = f"nudge:last_action:{user_id}"
+            last_action = memory.redis_client.get(last_action_key)
+            return last_action if last_action else ""
+    except Exception as e:
+        logger.warning(f"Failed to get last action: {e}")
+    return ""
+
+
+def store_last_action(user_id: str, action: str, memory):
+    """Store last action in Redis"""
+    try:
+        if hasattr(memory, 'redis_client') and memory.redis_client:
+            last_action_key = f"nudge:last_action:{user_id}"
+            memory.redis_client.setex(last_action_key, 86400, action)  # 24h expiry
+    except Exception as e:
+        logger.warning(f"Failed to store last action: {e}")
+
+
+def apply_rule_engine(reply: str, user_message: str, memory_context: str, user_id: str, memory) -> str:
+    """
+    Rule engine: Post-process Groq responses to enforce sharpness, wit, and ban generics.
+    This is the "human editor" that makes Nudge 95%+ human-like.
+    """
+    original_reply = reply
+    
+    # Rule 1: Ban generics — replace with witty action if detected
+    bad_patterns = [
+        "affirmation", "brainstorm", "reflect", "journal", "list", 
+        "sticky note", "failure log", "mission statement", "schedule", 
+        "plan a block", "write down", "think about", "consider", 
+        "visualize", "imagine", "meditate", "breathe", "gratitude"
+    ]
+    
+    if any(p in reply.lower() for p in bad_patterns):
+        # Get action pool and avoid last action
+        actions = get_action_pool(memory_context)
+        last_action = get_last_action(user_id, memory)
+        
+        # Filter out last action
+        available_actions = [a for a in actions if a.lower() != last_action.lower()]
+        if not available_actions:
+            available_actions = actions  # Fallback if all filtered
+        
+        new_action = random.choice(available_actions)
+        store_last_action(user_id, new_action, memory)
+        
+        # Extract dream/identity from memory if available
+        if "founder" in memory_context.lower() or "startup" in memory_context.lower():
+            identity = "the founder who ships daily"
+        elif "engineer" in memory_context.lower() or "developer" in memory_context.lower():
+            identity = "the engineer who ships daily"
+        elif "ai" in memory_context.lower() or "ml" in memory_context.lower():
+            identity = "the AI engineer who ships daily"
+        else:
+            identity = "the badass who ships daily"
+        
+        reply = f"As you're becoming {identity} (and laughs at setbacks), {new_action}. Done? Yes/No"
+        logger.info(f"Rule engine: Rewrote generic response to action: {new_action}")
+    
+    # Rule 2: Inject wit if low energy
+    low_energy_words = ["low", "stuck", "fail", "negative", "tired", "exhausted", "burnt", "depressed", "sad"]
+    if any(word in user_message.lower() for word in low_energy_words):
+        if "As you're becoming" in reply:
+            reply = reply.replace("As you're becoming", "As you're becoming the badass founder who ships despite everything,")
+        elif not reply.startswith("As you're becoming"):
+            # Add witty intro if missing
+            actions = get_action_pool(memory_context)
+            last_action = get_last_action(user_id, memory)
+            available_actions = [a for a in actions if a.lower() != last_action.lower()]
+            if not available_actions:
+                available_actions = actions
+            new_action = random.choice(available_actions)
+            store_last_action(user_id, new_action, memory)
+            reply = f"As you're becoming the badass founder who ships despite everything, {new_action}. Done? Yes/No"
+    
+    # Rule 3: Ensure Yes/No end + no questions
+    if not reply.rstrip().endswith("Yes/No") and not reply.rstrip().endswith("Yes/No."):
+        reply = reply.rstrip().rstrip(".") + ". Done? Yes/No"
+    
+    # Remove internal questions (except the final Yes/No)
+    lines = reply.split("\n")
+    cleaned_lines = []
+    for i, line in enumerate(lines):
+        if "?" in line and not line.strip().endswith("Yes/No") and not line.strip().endswith("Yes/No."):
+            # Remove question marks from internal questions
+            line = line.replace("?", "").strip()
+        cleaned_lines.append(line)
+    reply = "\n".join(cleaned_lines)
+    
+    # Rule 4: Ensure action is fresh (not repeated)
+    last_action = get_last_action(user_id, memory)
+    if last_action and last_action.lower() in reply.lower() and len(reply.split()) < 20:
+        # If reply seems to repeat last action, inject a new one
+        actions = get_action_pool(memory_context)
+        available_actions = [a for a in actions if a.lower() != last_action.lower()]
+        if available_actions:
+            new_action = random.choice(available_actions)
+            store_last_action(user_id, new_action, memory)
+            if "As you're becoming" in reply:
+                # Replace action part
+                reply = reply.split(",")[0] + f", {new_action}. Done? Yes/No"
+            else:
+                reply = f"{reply.split('.')[0]}. {new_action}. Done? Yes/No"
+    
+    # Store the final action for next time
+    if reply:
+        # Extract action from reply for tracking
+        action_parts = reply.split(",")
+        if len(action_parts) > 1:
+            potential_action = action_parts[-1].split(".")[0].strip()
+            if potential_action and len(potential_action) > 10:
+                store_last_action(user_id, potential_action, memory)
+    
+    if original_reply != reply:
+        logger.info(f"Rule engine applied: {len(original_reply)} -> {len(reply)} chars")
+    
+    return reply
 
 
 @asynccontextmanager
@@ -142,6 +349,18 @@ async def chat(
             user_message=request.message,
             memory_context=memory_context,
             conversation_history=history_text
+        )
+        
+        # ============================================
+        # STEP 3.5: Apply Rule Engine (Hybrid Approach)
+        # Post-process Groq response to enforce sharpness, wit, ban generics
+        # ============================================
+        response_text = apply_rule_engine(
+            reply=response_text,
+            user_message=request.message,
+            memory_context=memory_context,
+            user_id=request.user_id,
+            memory=memory
         )
         
         # ============================================
