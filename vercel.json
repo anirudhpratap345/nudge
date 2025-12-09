@@ -5,6 +5,10 @@
       "src": "api/main.py",
       "use": "@vercel/python",
       "config": { "runtime": "python3.10" }
+    },
+    {
+      "src": "nudge-api/frontend/(.*)",
+      "use": "@vercel/static"
     }
   ],
   "routes": [
@@ -17,7 +21,7 @@
     },
     {
       "src": "/(.*)",
-      "dest": "/frontend/index.html"
+      "dest": "nudge-api/frontend/index.html"
     }
   ]
 }
