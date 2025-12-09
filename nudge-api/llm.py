@@ -114,8 +114,8 @@ class GroqLLM(BaseLLM):
                 messages=messages,
                 temperature=0.05,  # Low for rule adherence
                 max_tokens=150,     # Short for snappiness
-                top_p=0.8,          # Balanced variety
-                repetition_penalty=1.2  # Kills loops
+                top_p=0.8          # Balanced variety
+                # Note: Groq API doesn't support repetition_penalty parameter
             )
             
             return response.choices[0].message.content

@@ -5,10 +5,6 @@
       "src": "api/main.py",
       "use": "@vercel/python",
       "config": { "runtime": "python3.10" }
-    },
-    {
-      "src": "nudge-api/frontend/(.*)",
-      "use": "@vercel/static"
     }
   ],
   "routes": [
@@ -17,11 +13,8 @@
       "dest": "api/main.py"
     },
     {
-      "handle": "filesystem"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "nudge-api/frontend/index.html"
+      "src": "/health",
+      "dest": "api/main.py"
     }
   ]
 }
