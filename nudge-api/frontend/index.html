@@ -736,15 +736,19 @@
                     })
                 });
 
-                if (!response.ok) throw new Error('API error');
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('API error:', response.status, errorText);
+                    throw new Error(`API error: ${response.status} ${errorText}`);
+                }
 
                 const data = await response.json();
                 removeTypingIndicator();
-                addMessage(data.response, false, data.memories_used);
+                addMessage(data.response, false, data.memories_used || 0);
                 setOnline();
                 
             } catch (error) {
-                console.error('Error:', error);
+                console.error('Chat error:', error);
                 removeTypingIndicator();
                 addMessage('Unable to connect to Nudge. Please check your connection and try again.', false);
                 setOffline();
@@ -763,9 +767,11 @@
                 if (response.ok) {
                     setOnline();
                 } else {
+                    console.error('Health check failed:', response.status, response.statusText);
                     setOffline();
                 }
             } catch (error) {
+                console.error('Health check error:', error);
                 setOffline();
             }
         }

@@ -16,11 +16,11 @@ from .models import (
 
 # Lazy imports to avoid slow startup
 def get_memory_manager():
-    from memory import get_memory_manager as _get_memory_manager
+    from .memory import get_memory_manager as _get_memory_manager
     return _get_memory_manager()
 
 def get_llm():
-    from llm import get_llm as _get_llm
+    from .llm import get_llm as _get_llm
     return _get_llm()
 
 # Type hints for dependency injection
