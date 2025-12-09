@@ -6,7 +6,7 @@ from typing import Optional, List, Dict
 import logging
 from datetime import datetime
 
-from config import get_settings, NUDGE_SYSTEM_PROMPT
+from .config import get_settings, NUDGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 

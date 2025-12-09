@@ -15,7 +15,7 @@ from datetime import datetime
 import logging
 import redis
 
-from config import get_settings
+from .config import get_settings
 
 logger = logging.getLogger(__name__)
 

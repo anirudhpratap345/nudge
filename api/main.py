@@ -7,8 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 
-from config import get_settings, NUDGE_SYSTEM_PROMPT
-from models import (
+from .config import get_settings, NUDGE_SYSTEM_PROMPT
+from .models import (
     ChatRequest, ChatResponse,
     StoreMemoryRequest, MemoryEntry,
     UserProfile, HealthResponse
