@@ -77,7 +77,7 @@ class GroqLLM(BaseLLM):
         self._client = None
     
     @property
-    def client(self):
+    def client(self):  
         """Lazy load the Groq client"""
         if self._client is None:
             try:
