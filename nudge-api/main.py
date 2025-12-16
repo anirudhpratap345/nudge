@@ -345,44 +345,60 @@ async def chat(
         # STEP 3: Generate Response
         # Memory context + conversation history → Nudge response
         # ============================================
-        response_text = llm.generate(
-            user_message=request.message,
-            memory_context=memory_context,
-            conversation_history=history_text
-        )
+        try:
+            response_text = llm.generate(
+                user_message=request.message,
+                memory_context=memory_context,
+                conversation_history=history_text
+            )
+        except Exception as e:
+            logger.error(f"LLM generation error: {e}")
+            # Return graceful error response as JSON
+            return ChatResponse(
+                response="Try again—connection hiccup. Done? Yes/No",
+                user_id=request.user_id,
+                memories_used=0
+            )
         
         # ============================================
         # STEP 3.5: Apply Rule Engine (Hybrid Approach)
         # Post-process Groq response to enforce sharpness, wit, ban generics
         # ============================================
-        response_text = apply_rule_engine(
-            reply=response_text,
-            user_message=request.message,
-            memory_context=memory_context,
-            user_id=request.user_id,
-            memory=memory
-        )
+        try:
+            response_text = apply_rule_engine(
+                reply=response_text,
+                user_message=request.message,
+                memory_context=memory_context,
+                user_id=request.user_id,
+                memory=memory
+            )
+        except Exception as e:
+            logger.error(f"Rule engine error: {e}")
+            # Continue with original response if rule engine fails
         
         # ============================================
         # STEP 4: Store as New Memories
         # ============================================
         # Store user message
-        memory.store_memory(
-            user_id=request.user_id,
-            content=f"User said: {request.message}",
-            memory_type="conversation"
-        )
-        
-        # Store assistant response
-        memory.store_memory(
-            user_id=request.user_id,
-            content=f"Nudge responded: {response_text[:200]}...",  # Truncate for storage
-            memory_type="conversation"
-        )
-        
-        # Cache in Redis for quick access
-        memory.cache_message(request.user_id, "user", request.message)
-        memory.cache_message(request.user_id, "assistant", response_text)
+        try:
+            memory.store_memory(
+                user_id=request.user_id,
+                content=f"User said: {request.message}",
+                memory_type="conversation"
+            )
+            
+            # Store assistant response
+            memory.store_memory(
+                user_id=request.user_id,
+                content=f"Nudge responded: {response_text[:200]}...",  # Truncate for storage
+                memory_type="conversation"
+            )
+            
+            # Cache in Redis for quick access
+            memory.cache_message(request.user_id, "user", request.message)
+            memory.cache_message(request.user_id, "assistant", response_text)
+        except Exception as e:
+            logger.warning(f"Memory storage error (non-fatal): {e}")
         
         return ChatResponse(
             response=response_text,
@@ -392,7 +408,12 @@ async def chat(
         
     except Exception as e:
         logger.error(f"Chat error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return JSON error response instead of raising HTTPException
+        return ChatResponse(
+            response="Try again—connection hiccup. Done? Yes/No",
+            user_id=request.user_id if hasattr(request, 'user_id') else "unknown",
+            memories_used=0
+        )
 
 
 # =============================================
