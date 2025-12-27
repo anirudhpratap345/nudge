@@ -544,6 +544,91 @@ class MemoryManager:
     # Utility Methods
     # =========================================
     
+    def get_personality_profile(self, user_id: str) -> Dict[str, Any]:
+        """
+        Extract personality insights from all user memories.
+        Returns: energy patterns, communication style, struggle themes.
+        """
+        try:
+            # Get all memories for user by searching with a broad query
+            # We'll retrieve more memories than usual to analyze patterns
+            all_memories = self.retrieve_memories(
+                user_id=user_id,
+                query="user activities goals struggles wins progress",  # Broad query to get diverse memories
+                n_results=50  # Get more memories for analysis
+            )
+            
+            if not all_memories:
+                return {"status": "new_user", "insights": []}
+            
+            # Combine all text from memories
+            full_history = " ".join([
+                str(m.get("content", m.get("text", ""))) 
+                for m in all_memories
+            ])
+            
+            if not full_history.strip():
+                return {"status": "new_user", "insights": []}
+            
+            # Simple keyword-based analysis (can enhance with LLM later)
+            profile = {
+                "total_interactions": len(all_memories),
+                "energy_patterns": self._detect_energy(full_history),
+                "struggle_themes": self._detect_struggles(full_history),
+                "communication_preference": self._detect_style(full_history)
+            }
+            
+            return profile
+            
+        except Exception as e:
+            logger.error(f"Error getting personality profile: {e}")
+            return {"status": "error", "insights": []}
+    
+    def _detect_energy(self, text: str) -> str:
+        """Detect energy level from language patterns"""
+        text_lower = text.lower()
+        high_energy = ["excited", "pumped", "energized", "can't wait", "motivated", "ready", "eager"]
+        low_energy = ["tired", "overwhelm", "exhausted", "drained", "burnt", "fatigue", "worn"]
+        
+        high_count = sum(1 for word in high_energy if word in text_lower)
+        low_count = sum(1 for word in low_energy if word in text_lower)
+        
+        if high_count > low_count:
+            return "high"
+        elif low_count > high_count:
+            return "low"
+        return "moderate"
+    
+    def _detect_struggles(self, text: str) -> List[str]:
+        """Extract common struggle themes"""
+        struggles = []
+        text_lower = text.lower()
+        
+        if "procrast" in text_lower:
+            struggles.append("procrastination")
+        if "overwhelm" in text_lower or "overwhelmed" in text_lower:
+            struggles.append("overwhelm")
+        if "focus" in text_lower or "distract" in text_lower or "concentrat" in text_lower:
+            struggles.append("focus_issues")
+        if "imposter" in text_lower or "not good enough" in text_lower or "self-doubt" in text_lower:
+            struggles.append("imposter_syndrome")
+        if "anxious" in text_lower or "anxiety" in text_lower or "worried" in text_lower:
+            struggles.append("anxiety")
+        if "stuck" in text_lower or "blocked" in text_lower:
+            struggles.append("feeling_stuck")
+        
+        return struggles[:3]  # Top 3
+    
+    def _detect_style(self, text: str) -> str:
+        """Detect preferred communication style"""
+        text_lower = text.lower()
+        
+        if "gentle" in text_lower or "kind" in text_lower or "soft" in text_lower or "patient" in text_lower:
+            return "gentle"
+        elif "direct" in text_lower or "straight" in text_lower or "blunt" in text_lower or "sharp" in text_lower:
+            return "direct"
+        return "balanced"
+    
     def get_user_stats(self, user_id: str) -> Dict[str, Any]:
         """Get stats about a user's stored memories"""
         if not FAISS_AVAILABLE:

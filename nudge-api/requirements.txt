@@ -26,6 +26,7 @@ numpy>=1.24.0
 # Utilities
 python-dotenv==1.0.0
 httpx==0.26.0
+requests==2.31.0  # For testing endpoints
 
 # For NV-Embed-v2 (if using full model)
 # einops>=0.7.0

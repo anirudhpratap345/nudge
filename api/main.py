@@ -668,6 +668,20 @@ async def improved_advisor_nudge(
             memories
         )
         
+        # 3.5. Get deep personality profile from memory
+        try:
+            personality_profile = memory.get_personality_profile(request.user_id)
+            if personality_profile and personality_profile.get("status") != "new_user":
+                # Merge profile insights into traits
+                if personality_profile.get("energy_patterns"):
+                    personality_traits["energy_pattern"] = personality_profile["energy_patterns"]
+                if personality_profile.get("communication_preference"):
+                    personality_traits["style"] = personality_profile["communication_preference"]
+                if personality_profile.get("struggle_themes"):
+                    personality_traits["struggles"] = personality_profile["struggle_themes"]
+        except Exception as e:
+            logger.warning(f"Failed to get personality profile: {e}")
+        
         # Format personality traits as string for prompt
         personality_str = ", ".join([f"{k}: {v}" for k, v in personality_traits.items()]) if personality_traits else "exploring preferences"
         
@@ -739,7 +753,27 @@ async def improved_advisor_nudge(
         # 7. Parse into nudge + visualization
         parsed = _parse_mckenna_response(response_text)
         
-        # 8. Store interaction in memory
+        # 8. Generate structured visualization (enhanced version)
+        try:
+            structured_viz = generate_structured_visualization(
+                dream=request.dream,
+                personality=personality_traits,
+                llm=llm
+            )
+            
+            # Merge structured visualization into parsed response
+            parsed["visualization"] = {
+                "title": structured_viz["title"],
+                "phases": structured_viz["phases"],
+                "steps": structured_viz["steps"],
+                "full_text": structured_viz["full_text"],
+                "duration_seconds": structured_viz["total_duration"]
+            }
+        except Exception as e:
+            logger.warning(f"Failed to generate structured visualization, using parsed version: {e}")
+            # Continue with parsed visualization if structured generation fails
+        
+        # 9. Store interaction in memory
         try:
             memory.store_memory(
                 user_id=request.user_id,
@@ -808,18 +842,138 @@ def _extract_personality(
     return traits if traits else {"status": "exploring_preferences"}
 
 
+def generate_structured_visualization(
+    dream: str,
+    personality: dict,
+    llm
+) -> dict:
+    """
+    Generate a structured McKenna-style visualization with specific phases.
+    
+    Creates a 90-second guided visualization with 4 distinct phases:
+    1. GROUND (15s): Breath awareness, present moment
+    2. IMAGINE (30s): Vivid sensory details of achieving the dream
+    3. EMBODY (30s): Feel the identity shift - "I AM this person"
+    4. COMMIT (15s): One small action to take today
+    """
+    personality_str = ", ".join([f"{k}: {v}" for k, v in personality.items()]) if personality else "exploring preferences"
+    
+    viz_prompt = f"""Create a 90-second guided visualization for this dream: {dream}
+
+Structure it in 4 phases:
+1. GROUND (15s): Breath awareness, present moment
+2. IMAGINE (30s): Vivid sensory details of achieving the dream
+3. EMBODY (30s): Feel the identity shift - "I AM this person"
+4. COMMIT (15s): One small action to take today
+
+Use McKenna's language: sensory-rich, present tense, repetitive affirmations.
+
+Personality context: {personality_str}
+
+Format each phase on a new line starting with the phase name (e.g., "GROUND: ...")."""
+
+    # Use LLM to generate visualization
+    system_prompt = "You are Paul McKenna's AI assistant, expert in hypnotic visualization. Create sensory-rich, transformative visualizations."
+    
+    # Build messages for Groq API
+    if hasattr(llm, 'client'):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": viz_prompt}
+        ]
+        
+        try:
+            response = llm.client.chat.completions.create(
+                model=llm.settings.groq_model,
+                messages=messages,
+                temperature=0.5,  # Higher for creative visualization
+                max_tokens=300,
+                top_p=0.8
+            )
+            viz_response = response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Error generating visualization: {e}")
+            # Fallback visualization
+            viz_response = """GROUND: Close your eyes. Take three deep breaths. Feel your body relaxing with each exhale.
+IMAGINE: See yourself achieving your dream. Notice the details around you. Hear the sounds. Feel the confidence.
+EMBODY: You ARE the person who has achieved this. Feel this identity in your bones. This is who you are becoming.
+COMMIT: Open your eyes. Take one small action today that moves you closer to this reality."""
+    else:
+        # Fallback: use regular generate
+        viz_response = llm.generate(
+            user_message=viz_prompt,
+            memory_context="",
+            conversation_history=""
+        )
+    
+    # Parse phases
+    phases = {}
+    phase_order = ["GROUND", "IMAGINE", "EMBODY", "COMMIT"]
+    
+    for line in viz_response.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        for phase in phase_order:
+            if line.upper().startswith(phase):
+                # Extract text after phase name
+                phase_text = line.split(":", 1)[1].strip() if ":" in line else line.replace(phase, "").strip()
+                phases[phase] = phase_text
+                break
+    
+    # Fill in missing phases with fallbacks
+    fallbacks = {
+        "GROUND": "Close your eyes. Take three deep breaths. Feel your body relaxing with each exhale.",
+        "IMAGINE": "See yourself achieving your dream. Notice the details around you. Hear the sounds. Feel the confidence.",
+        "EMBODY": "You ARE the person who has achieved this. Feel this identity in your bones. This is who you are becoming.",
+        "COMMIT": "Open your eyes. Take one small action today that moves you closer to this reality."
+    }
+    
+    for phase in phase_order:
+        if phase not in phases:
+            phases[phase] = fallbacks[phase]
+    
+    # Create steps from phases
+    steps = [
+        {"text": phases["GROUND"], "duration_seconds": 15},
+        {"text": phases["IMAGINE"], "duration_seconds": 30},
+        {"text": phases["EMBODY"], "duration_seconds": 30},
+        {"text": phases["COMMIT"], "duration_seconds": 15}
+    ]
+    
+    return {
+        "title": f"Journey to: {dream[:50]}",
+        "phases": phases,
+        "steps": steps,
+        "total_duration": 90,
+        "full_text": viz_response
+    }
+
+
 def _parse_mckenna_response(response: str) -> dict:
     """Parse LLM response into structured nudge + visualization"""
-    # Split on markers
-    parts = response.split("VISUALIZATION:", 1)
+    import re
+    
+    # Clean up markdown formatting
+    response = re.sub(r'\*{2,}', '', response)  # Remove ** and ****
+    response = response.strip()
+    
+    # Try to split on explicit markers first
+    parts = re.split(r'VISUALIZATION:', response, flags=re.IGNORECASE)
     
     if len(parts) == 2:
-        nudge = parts[0].replace("NUDGE:", "").strip()
+        nudge_raw = parts[0].strip()
         viz_text = parts[1].strip()
+        
+        # Clean nudge: remove "NUDGE:" header and any markdown
+        nudge = re.sub(r'^NUDGE:?\s*', '', nudge_raw, flags=re.IGNORECASE).strip()
+        nudge = re.sub(r'\*+', '', nudge).strip()  # Remove any remaining markdown
     else:
-        # Fallback: first paragraph is nudge, rest is visualization
+        # Fallback: try to find nudge in first paragraph
         paragraphs = [p.strip() for p in response.split("\n\n") if p.strip()]
+        
         if len(paragraphs) >= 2:
+            # First paragraph is likely nudge
             nudge = paragraphs[0].strip()
             viz_text = "\n\n".join(paragraphs[1:]).strip()
         elif len(paragraphs) == 1:
@@ -829,11 +983,38 @@ def _parse_mckenna_response(response: str) -> dict:
                 nudge = ". ".join(sentences[:2]) + "."
                 viz_text = ". ".join(sentences[2:])
             else:
+                # Use entire response as nudge, generate fallback viz
                 nudge = response
                 viz_text = "Close your eyes. Feel your breath slowing. See yourself achieving your dream."
         else:
             nudge = response
             viz_text = "Close your eyes. Feel your breath slowing. See yourself achieving your dream."
+    
+    # Clean up nudge: remove headers, incomplete sentences, markdown
+    nudge = re.sub(r'^(Today\'s|Your|Nudge|NUDGE)[:\s]*', '', nudge, flags=re.IGNORECASE).strip()
+    nudge = re.sub(r'\*+', '', nudge).strip()
+    
+    # Remove incomplete sentences (ending with ":" or "?" without completion)
+    nudge_lines = nudge.split('\n')
+    cleaned_lines = []
+    for line in nudge_lines:
+        line = line.strip()
+        # Skip lines that are just headers or incomplete
+        if line and not line.endswith(':') and not line.endswith('?'):
+            cleaned_lines.append(line)
+        elif line and (line.endswith('.') or len(line) > 50):
+            cleaned_lines.append(line)
+    
+    nudge = ' '.join(cleaned_lines).strip()
+    
+    # Validate nudge: must have actual content, not just headers
+    if not nudge or len(nudge) < 20 or nudge.lower().startswith(('today\'s', 'your', 'nudge')):
+        # Generate fallback nudge based on common patterns
+        nudge = "Open your project and make one small commit. Set a 10-minute timer. Done? Yes/No"
+    
+    # Ensure nudge ends properly
+    if not nudge.endswith(('.', '!', '?')):
+        nudge = nudge.rstrip('.') + '.'
     
     # Break visualization into steps (split by sentence/paragraph)
     viz_sentences = [s.strip() for s in viz_text.split(". ") if len(s.strip()) > 20]

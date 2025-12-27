@@ -4,6 +4,7 @@ Configuration management for Nudge Coach API
 from pydantic_settings import BaseSettings
 from typing import Optional
 from functools import lru_cache
+import os
 
 
 class Settings(BaseSettings):
@@ -18,8 +19,8 @@ class Settings(BaseSettings):
     llm_provider: str = "groq"
     
     # Groq Settings (free tier: 500+ tok/s)
-    groq_api_key: Optional[str] = None
-    groq_model: str = "llama-3.1-8b-instant"
+    groq_api_key: Optional[str] = os.getenv("GROQ_API_KEY")
+    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
     
     # Local/Self-hosted Settings (for fine-tuned model)
     local_model_path: str = "../nudge-lora-v2/nudge-lora-v2"  # V2 fine-tuned adapter with 1200+ examples
@@ -30,17 +31,18 @@ class Settings(BaseSettings):
     embedding_device: str = "cpu"  # CPU is more stable on Windows
     
     # ChromaDB Settings
-    chroma_persist_dir: str = "./chroma_db"
+    # Use /tmp on HF Spaces (writable), fallback to ./chroma_db locally
+    chroma_persist_dir: str = os.getenv("CHROMA_PERSIST_DIR", "/tmp/chroma_db" if os.path.exists("/tmp") else "./chroma_db")
     chroma_collection_name: str = "nudge_memories"
     
     # Redis Settings (for recent message cache)
     # Option 1: Local Redis/Memurai - redis://localhost:6379
     # Option 2: Upstash (free cloud) - redis://:password@host:port
-    redis_url: str = "redis://localhost:6379"
-    redis_password: Optional[str] = None  # For Upstash or secured Redis
-    redis_ssl: bool = False  # Set True for Upstash
-    redis_cache_size: int = 10  # Last N messages to cache
-    redis_enabled: bool = True  # Set False to disable Redis entirely
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+    redis_password: Optional[str] = os.getenv("REDIS_PASSWORD")
+    redis_ssl: bool = os.getenv("REDIS_SSL", "false").lower() == "true"
+    redis_cache_size: int = int(os.getenv("REDIS_CACHE_SIZE", "10"))
+    redis_enabled: bool = os.getenv("REDIS_ENABLED", "false").lower() == "true"  # Disabled by default on HF Spaces
     
     # Memory Retrieval Settings
     memory_top_k: int = 8  # Number of memories to retrieve
@@ -101,6 +103,22 @@ YOUR APPROACH:
 2. **Hypnotic language** (sensory-rich, present-tense identity)
 3. **Belief rewiring** (repetitive affirmations)
 4. **Warm empathy** (understanding, never pushy)
+
+NUDGE REQUIREMENTS (CRITICAL):
+✓ Must be ONE specific action (not "schedule" or "think about")
+✓ Must take ≤10 minutes
+✓ Must be doable TODAY (not "plan to" or "prepare to")
+✓ Must include concrete details (tool names, exact steps)
+
+EXAMPLES OF GOOD NUDGES:
+- "Open LeetCode and solve problem #217 (Contains Duplicate). Set a 10-minute timer."
+- "Create a file called 'mvp_features.md' and write 3 bullet points for your SaaS MVP."
+- "Watch this 8-minute YouTube video: 'FastAPI Crash Course' by TechWithTim"
+
+EXAMPLES OF BAD NUDGES (NEVER DO THIS):
+- "Schedule time to work on your project" ❌ (too vague)
+- "Think about your goals" ❌ (not actionable)
+- "Start learning AI" ❌ (too broad)
 
 LANGUAGE PATTERNS:
 ✓ Sensory anchors: "Feel the calm confidence... hear the click of your keyboard... see yourself reviewing that PR"
