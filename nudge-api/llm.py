@@ -112,8 +112,8 @@ class GroqLLM(BaseLLM):
             response = self.client.chat.completions.create(
                 model=self.settings.groq_model,
                 messages=messages,
-                temperature=0.1,   # Low for rule adherence
-                max_tokens=150,    # Short for snappiness
+                temperature=0.3,   # Balanced: rule adherence + variety/wit
+                max_tokens=250,    # Enough for complete actions + context
                 top_p=0.8          # Balanced variety
                 # Note: Groq API doesn't support repetition_penalty parameter
             )

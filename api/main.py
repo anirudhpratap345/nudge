@@ -9,11 +9,12 @@ import logging
 import random
 import json
 
-from .config import get_settings, NUDGE_SYSTEM_PROMPT
+from .config import get_settings, NUDGE_SYSTEM_PROMPT, MCKENNA_SYSTEM_PROMPT
 from .models import (
     ChatRequest, ChatResponse,
     StoreMemoryRequest, MemoryEntry,
-    UserProfile, HealthResponse
+    UserProfile, HealthResponse,
+    ImprovedNudgeRequest, ImprovedNudgeResponse, Message
 )
 
 # Lazy imports to avoid slow startup
@@ -147,100 +148,191 @@ def apply_rule_engine(reply: str, user_message: str, memory_context: str, user_i
     Rule engine: Post-process Groq responses to enforce sharpness, wit, and ban generics.
     This is the "human editor" that makes Nudge 95%+ human-like.
     """
+    import re
+    
     original_reply = reply
     
-    # Rule 1: Ban generics — replace with witty action if detected
-    bad_patterns = [
-        "affirmation", "brainstorm", "reflect", "journal", "list", 
-        "sticky note", "failure log", "mission statement", "schedule", 
-        "plan a block", "write down", "think about", "consider", 
-        "visualize", "imagine", "meditate", "breathe", "gratitude"
-    ]
-    
-    if any(p in reply.lower() for p in bad_patterns):
-        # Get action pool and avoid last action
+    # Validation: Check if response is empty or too short
+    if not reply or not reply.strip() or len(reply.strip()) < 10:
+        logger.warning("Empty or too short response, using fallback")
         actions = get_action_pool(memory_context)
         last_action = get_last_action(user_id, memory)
-        
-        # Filter out last action
         available_actions = [a for a in actions if a.lower() != last_action.lower()]
         if not available_actions:
-            available_actions = actions  # Fallback if all filtered
-        
+            available_actions = actions
         new_action = random.choice(available_actions)
+        identity = extract_identity(memory_context)
+        reply = f"As you're becoming {identity}, {new_action}. Done? Yes/No"
         store_last_action(user_id, new_action, memory)
-        
-        # Extract dream/identity from memory if available
-        if "founder" in memory_context.lower() or "startup" in memory_context.lower():
-            identity = "the founder who ships daily"
-        elif "engineer" in memory_context.lower() or "developer" in memory_context.lower():
-            identity = "the engineer who ships daily"
-        elif "ai" in memory_context.lower() or "ml" in memory_context.lower():
-            identity = "the AI engineer who ships daily"
-        else:
-            identity = "the badass who ships daily"
-        
-        reply = f"As you're becoming {identity} (and laughs at setbacks), {new_action}. Done? Yes/No"
-        logger.info(f"Rule engine: Rewrote generic response to action: {new_action}")
+        return reply
     
-    # Rule 2: Inject wit if low energy
-    low_energy_words = ["low", "stuck", "fail", "negative", "tired", "exhausted", "burnt", "depressed", "sad"]
-    if any(word in user_message.lower() for word in low_energy_words):
-        if "As you're becoming" in reply:
-            reply = reply.replace("As you're becoming", "As you're becoming the badass founder who ships despite everything,")
-        elif not reply.startswith("As you're becoming"):
-            # Add witty intro if missing
+    # Normalize whitespace
+    reply = " ".join(reply.split())
+    
+    # Rule 1: Ban generics — use whole word matching to avoid false positives
+    bad_patterns = [
+        r'\baffirmation\b', r'\bbrainstorm\b', r'\breflect\b', r'\bjournal\b', 
+        r'\bsticky note\b', r'\bfailure log\b', r'\bmission statement\b', 
+        r'\bplan a block\b', r'\bwrite down\b', r'\bthink about\b', 
+        r'\bvisualize\b', r'\bimagine\b', r'\bmeditate\b', r'\bbreathe\b', 
+        r'\bgratitude\b', r'\bconsider\b'
+    ]
+    
+    # Check if reply contains bad patterns (whole words only)
+    has_bad_pattern = False
+    for pattern in bad_patterns:
+        if re.search(pattern, reply.lower()):
+            has_bad_pattern = True
+            break
+    
+    if has_bad_pattern:
+        # Extract any good action from the reply before replacing
+        # Look for action-like phrases (imperative verbs + objects)
+        action_pattern = r'(?:open|solve|write|create|add|push|run|implement|build|fix|refactor|update|test|deploy)\s+[^.!?]+'
+        existing_actions = re.findall(action_pattern, reply, re.IGNORECASE)
+        
+        if existing_actions and len(existing_actions[0]) > 15:
+            # Preserve the action, just clean up the generic parts
+            good_action = existing_actions[0].strip()
+            identity = extract_identity(memory_context)
+            reply = f"As you're becoming {identity}, {good_action}. Done? Yes/No"
+            store_last_action(user_id, good_action, memory)
+            logger.info(f"Rule engine: Preserved action, removed generics: {good_action[:50]}")
+        else:
+            # No good action found, replace with fresh one
             actions = get_action_pool(memory_context)
             last_action = get_last_action(user_id, memory)
             available_actions = [a for a in actions if a.lower() != last_action.lower()]
             if not available_actions:
                 available_actions = actions
             new_action = random.choice(available_actions)
+            identity = extract_identity(memory_context)
+            reply = f"As you're becoming {identity}, {new_action}. Done? Yes/No"
             store_last_action(user_id, new_action, memory)
-            reply = f"As you're becoming the badass founder who ships despite everything, {new_action}. Done? Yes/No"
+            logger.info(f"Rule engine: Replaced generic response with action: {new_action[:50]}")
     
-    # Rule 3: Ensure Yes/No end + no questions
-    if not reply.rstrip().endswith("Yes/No") and not reply.rstrip().endswith("Yes/No."):
-        reply = reply.rstrip().rstrip(".") + ". Done? Yes/No"
+    # Rule 2: Inject wit if low energy (but preserve existing good content)
+    low_energy_words = ["low", "stuck", "fail", "negative", "tired", "exhausted", "burnt", "depressed", "sad"]
+    if any(word in user_message.lower() for word in low_energy_words):
+        if "As you're becoming" not in reply:
+            # Extract action from reply if present
+            action_pattern = r'(?:open|solve|write|create|add|push|run|implement|build|fix|refactor|update|test|deploy)\s+[^.!?]+'
+            existing_actions = re.findall(action_pattern, reply, re.IGNORECASE)
+            
+            if existing_actions:
+                good_action = existing_actions[0].strip()
+                identity = extract_identity(memory_context, low_energy=True)
+                reply = f"As you're becoming {identity}, {good_action}. Done? Yes/No"
+            else:
+                # No action found, add one
+                actions = get_action_pool(memory_context)
+                last_action = get_last_action(user_id, memory)
+                available_actions = [a for a in actions if a.lower() != last_action.lower()]
+                if not available_actions:
+                    available_actions = actions
+                new_action = random.choice(available_actions)
+                identity = extract_identity(memory_context, low_energy=True)
+                reply = f"As you're becoming {identity}, {new_action}. Done? Yes/No"
+                store_last_action(user_id, new_action, memory)
     
-    # Remove internal questions (except the final Yes/No)
+    # Rule 3: Ensure Yes/No end (but check for duplication first)
+    reply_stripped = reply.rstrip()
+    has_yes_no = reply_stripped.endswith("Yes/No") or reply_stripped.endswith("Yes/No.")
+    has_done = "Done?" in reply_stripped[-20:]  # Check last 20 chars
+    
+    if not has_yes_no:
+        if has_done:
+            # Already has "Done?" but missing "Yes/No"
+            reply = reply_stripped.rstrip(".") + " Yes/No"
+        else:
+            # Add both
+            reply = reply_stripped.rstrip(".") + ". Done? Yes/No"
+    
+    # Rule 4: Remove internal questions (but preserve rhetorical ones and emphasis)
+    # Only remove actual queries, not rhetorical questions
     lines = reply.split("\n")
     cleaned_lines = []
-    for i, line in enumerate(lines):
-        if "?" in line and not line.strip().endswith("Yes/No") and not line.strip().endswith("Yes/No."):
-            # Remove question marks from internal questions
+    for line in lines:
+        # Check if it's a real question (starts with question words)
+        is_real_question = re.match(r'^\s*(what|how|why|when|where|who|which|can|could|should|would|will|do|does|did|is|are|was|were)\s+', line.lower())
+        has_question_mark = "?" in line
+        is_final_yes_no = line.strip().endswith("Yes/No") or line.strip().endswith("Yes/No.")
+        
+        if has_question_mark and is_real_question and not is_final_yes_no:
+            # Remove question mark from real queries
             line = line.replace("?", "").strip()
         cleaned_lines.append(line)
     reply = "\n".join(cleaned_lines)
     
-    # Rule 4: Ensure action is fresh (not repeated)
+    # Rule 5: Ensure action is fresh (not repeated) - use better matching
     last_action = get_last_action(user_id, memory)
-    if last_action and last_action.lower() in reply.lower() and len(reply.split()) < 20:
-        # If reply seems to repeat last action, inject a new one
-        actions = get_action_pool(memory_context)
-        available_actions = [a for a in actions if a.lower() != last_action.lower()]
-        if available_actions:
-            new_action = random.choice(available_actions)
-            store_last_action(user_id, new_action, memory)
-            if "As you're becoming" in reply:
-                # Replace action part
-                reply = reply.split(",")[0] + f", {new_action}. Done? Yes/No"
-            else:
-                reply = f"{reply.split('.')[0]}. {new_action}. Done? Yes/No"
+    if last_action and len(last_action) > 10:
+        # Use word overlap to detect similarity, not exact substring
+        last_words = set(last_action.lower().split())
+        reply_words = set(reply.lower().split())
+        overlap = len(last_words & reply_words)
+        similarity = overlap / max(len(last_words), 1)
+        
+        # If >60% word overlap and reply is short, likely a repeat
+        if similarity > 0.6 and len(reply.split()) < 25:
+            actions = get_action_pool(memory_context)
+            available_actions = [a for a in actions if a.lower() != last_action.lower()]
+            if available_actions:
+                new_action = random.choice(available_actions)
+                store_last_action(user_id, new_action, memory)
+                # Preserve identity if present
+                if "As you're becoming" in reply:
+                    identity_part = reply.split(",")[0] if "," in reply else "As you're becoming the badass who ships daily"
+                    reply = f"{identity_part}, {new_action}. Done? Yes/No"
+                else:
+                    reply = f"{reply.split('.')[0]}. {new_action}. Done? Yes/No"
+                logger.info(f"Rule engine: Replaced repeated action with: {new_action[:50]}")
     
-    # Store the final action for next time
+    # Rule 6: Extract and store action for next time (improved extraction)
     if reply:
-        # Extract action from reply for tracking
-        action_parts = reply.split(",")
-        if len(action_parts) > 1:
-            potential_action = action_parts[-1].split(".")[0].strip()
-            if potential_action and len(potential_action) > 10:
-                store_last_action(user_id, potential_action, memory)
+        # Try multiple patterns to extract action
+        action_patterns = [
+            r'As you\'re becoming[^,]+,([^.!?]+)',  # After "As you're becoming..., action"
+            r'(?:open|solve|write|create|add|push|run|implement|build|fix|refactor|update|test|deploy)\s+[^.!?]+',  # Imperative action
+            r'\.\s*([A-Z][^.!?]+?)(?:\.|Done)',  # Sentence before "Done"
+        ]
+        
+        extracted_action = None
+        for pattern in action_patterns:
+            matches = re.findall(pattern, reply, re.IGNORECASE)
+            if matches:
+                extracted_action = matches[0].strip()
+                if len(extracted_action) > 10 and len(extracted_action) < 200:
+                    break
+        
+        if extracted_action:
+            store_last_action(user_id, extracted_action, memory)
     
     if original_reply != reply:
         logger.info(f"Rule engine applied: {len(original_reply)} -> {len(reply)} chars")
     
     return reply
+
+
+def extract_identity(memory_context: str, low_energy: bool = False) -> str:
+    """Extract user identity from memory context with better matching"""
+    context_lower = memory_context.lower()
+    
+    # More sophisticated identity extraction
+    if low_energy:
+        return "the badass who ships despite everything"
+    
+    # Check for specific identities (whole phrases, not just keywords)
+    if re.search(r'\b(founder|startup|entrepreneur|building|launching)\b', context_lower):
+        return "the founder who ships daily"
+    elif re.search(r'\b(ai|ml|machine learning|artificial intelligence|data scientist)\b', context_lower):
+        return "the AI engineer who ships daily"
+    elif re.search(r'\b(engineer|developer|programmer|coder|software|backend|frontend|full.?stack)\b', context_lower):
+        return "the engineer who ships daily"
+    elif re.search(r'\b(product manager|pm|product)\b', context_lower):
+        return "the PM who ships daily"
+    else:
+        return "the badass who ships daily"
 
 
 @asynccontextmanager
@@ -356,6 +448,15 @@ async def chat(
                 memory_context=memory_context,
                 conversation_history=history_text
             )
+            
+            # Validate response before rule engine
+            if not response_text or not response_text.strip():
+                logger.warning("LLM returned empty response, using fallback")
+                response_text = "Try again—connection hiccup. Done? Yes/No"
+            elif len(response_text.strip()) < 10:
+                logger.warning("LLM returned too short response, using fallback")
+                response_text = "Try again—connection hiccup. Done? Yes/No"
+                
         except Exception as e:
             logger.error(f"LLM generation error: {e}")
             # Return graceful error response as JSON
@@ -529,6 +630,235 @@ async def delete_user_memories(
     except Exception as e:
         logger.error(f"Delete memories error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================
+# IMPROVED ADVISOR NUDGE ENDPOINT
+# =============================================
+
+@app.post("/api/v1/improved-advisor-nudge", response_model=ImprovedNudgeResponse, tags=["Coaching"])
+async def improved_advisor_nudge(
+    request: ImprovedNudgeRequest,
+    memory = Depends(get_memory_manager),
+    llm = Depends(get_llm)
+):
+    """
+    Generate personalized nudge with McKenna-style hypnotic language.
+    
+    This endpoint delivers Unlimits' core value:
+    - Micro-action for TODAY (≤10 min)
+    - Hypnotic visualization (sensory-rich future self)
+    - Deep personalization (progress + personality adaptive)
+    """
+    try:
+        # 1. Retrieve deep context from memory
+        memories = memory.retrieve_memories(
+            user_id=request.user_id,
+            query=request.dream,
+            n_results=10
+        )
+        memory_context = memory.format_memory_context(memories)
+        
+        # 2. Build progress summary
+        progress_summary = _build_progress_summary(request.progress)
+        
+        # 3. Extract/format personality
+        personality_traits = _extract_personality(
+            request.personality,
+            memories
+        )
+        
+        # Format personality traits as string for prompt
+        personality_str = ", ".join([f"{k}: {v}" for k, v in personality_traits.items()]) if personality_traits else "exploring preferences"
+        
+        # 4. Build McKenna prompt
+        from datetime import datetime
+        try:
+            import pytz
+            ist = pytz.timezone('Asia/Kolkata')
+            today_date = datetime.now(ist).strftime("%A, %B %d, %Y")
+        except ImportError:
+            # Fallback if pytz not installed
+            today_date = datetime.now().strftime("%A, %B %d, %Y")
+        
+        mckenna_prompt = MCKENNA_SYSTEM_PROMPT.format(
+            dream=request.dream,
+            progress_summary=progress_summary,
+            personality_traits=personality_str,
+            memory_context=memory_context if memory_context else "(No memories yet - this is a new user)",
+            today_date=today_date
+        )
+        
+        # 5. Format conversation history if provided
+        conversation_history = ""
+        if request.history:
+            conversation_history = "\n".join([
+                f"{msg.role.value.capitalize()}: {msg.content}"
+                for msg in request.history[-5:]  # Last 5 messages
+            ])
+        
+        # 6. Generate response with McKenna voice
+        user_query = f"Give me today's nudge to move toward: {request.dream}"
+        
+        # Use existing LLM.generate() method but with custom system prompt
+        # We'll need to temporarily override the system prompt
+        original_prompt = NUDGE_SYSTEM_PROMPT
+        
+        # Create a custom prompt builder for this call
+        system_prompt = mckenna_prompt
+        full_context = f"{conversation_history}\n\nUser: {user_query}" if conversation_history else f"User: {user_query}"
+        
+        # Build messages for Groq API directly (since we need custom system prompt)
+        if hasattr(llm, 'client'):
+            # Groq LLM
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": full_context}
+            ]
+            
+            try:
+                response = llm.client.chat.completions.create(
+                    model=llm.settings.groq_model,
+                    messages=messages,
+                    temperature=0.4,  # Slightly higher for creative visualization
+                    max_tokens=400,   # More tokens for visualization
+                    top_p=0.8
+                )
+                response_text = response.choices[0].message.content
+            except Exception as e:
+                logger.error(f"Groq API error in improved_advisor_nudge: {e}")
+                response_text = "NUDGE: Open your project and make one small commit. VISUALIZATION: Close your eyes. Feel your breath slowing. See yourself as the engineer who ships daily."
+        else:
+            # Fallback: use regular generate method
+            response_text = llm.generate(
+                user_message=user_query,
+                memory_context=memory_context,
+                conversation_history=conversation_history
+            )
+        
+        # 7. Parse into nudge + visualization
+        parsed = _parse_mckenna_response(response_text)
+        
+        # 8. Store interaction in memory
+        try:
+            memory.store_memory(
+                user_id=request.user_id,
+                content=f"Dream: {request.dream}. Nudge: {parsed['nudge']}",
+                memory_type="coaching"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to store memory: {e}")
+        
+        return ImprovedNudgeResponse(
+            nudge=parsed["nudge"],
+            visualization=parsed["visualization"],
+            personality_insights=personality_traits,
+            tts_ready=False  # Set to True when TTS implemented
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in improved_advisor_nudge: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Helper functions for improved advisor nudge
+def _build_progress_summary(progress: dict) -> str:
+    """Format progress metrics into narrative"""
+    if not progress:
+        return "Just starting the journey"
+    
+    days = progress.get("days_active", 0)
+    wins = progress.get("wins", 0)
+    struggles = progress.get("struggles", [])
+    
+    summary = f"{days} days active, {wins} wins achieved"
+    if struggles:
+        summary += f". Current challenges: {', '.join(struggles[:3])}"  # Limit to 3
+    
+    return summary
+
+
+def _extract_personality(
+    personality: dict,
+    memories: list
+) -> dict:
+    """Extract personality traits from input + memory patterns"""
+    traits = {}
+    
+    # From explicit input
+    if personality.get("energy_level"):
+        traits["energy"] = personality["energy_level"]
+    if personality.get("preferred_style"):
+        traits["style"] = personality["preferred_style"]
+    
+    # From memory patterns (simple keyword extraction)
+    if memories:
+        memory_text = " ".join([
+            str(m.get("content", m.get("text", ""))) 
+            for m in memories[:5]  # Limit to first 5
+        ]).lower()
+        
+        if "overwhelm" in memory_text or "stuck" in memory_text:
+            traits["tends_toward"] = "overwhelm"
+        elif "excit" in memory_text or "motivat" in memory_text:
+            traits["tends_toward"] = "high_enthusiasm"
+        elif "tired" in memory_text or "burnt" in memory_text:
+            traits["tends_toward"] = "low_energy"
+    
+    return traits if traits else {"status": "exploring_preferences"}
+
+
+def _parse_mckenna_response(response: str) -> dict:
+    """Parse LLM response into structured nudge + visualization"""
+    # Split on markers
+    parts = response.split("VISUALIZATION:", 1)
+    
+    if len(parts) == 2:
+        nudge = parts[0].replace("NUDGE:", "").strip()
+        viz_text = parts[1].strip()
+    else:
+        # Fallback: first paragraph is nudge, rest is visualization
+        paragraphs = [p.strip() for p in response.split("\n\n") if p.strip()]
+        if len(paragraphs) >= 2:
+            nudge = paragraphs[0].strip()
+            viz_text = "\n\n".join(paragraphs[1:]).strip()
+        elif len(paragraphs) == 1:
+            # Single paragraph - try to split by sentence
+            sentences = [s.strip() for s in response.split(". ") if s.strip()]
+            if len(sentences) >= 3:
+                nudge = ". ".join(sentences[:2]) + "."
+                viz_text = ". ".join(sentences[2:])
+            else:
+                nudge = response
+                viz_text = "Close your eyes. Feel your breath slowing. See yourself achieving your dream."
+        else:
+            nudge = response
+            viz_text = "Close your eyes. Feel your breath slowing. See yourself achieving your dream."
+    
+    # Break visualization into steps (split by sentence/paragraph)
+    viz_sentences = [s.strip() for s in viz_text.split(". ") if len(s.strip()) > 20]
+    if not viz_sentences:
+        # Fallback steps
+        viz_sentences = [
+            "Close your eyes and take three deep breaths",
+            "Feel your body relaxing with each exhale",
+            "See yourself in your future, achieving your dream",
+            "Notice the confidence and calm you feel",
+            "Open your eyes, ready to take action"
+        ]
+    
+    # Limit to 5 steps, each ~20 seconds
+    steps = viz_sentences[:5]
+    
+    return {
+        "nudge": nudge,
+        "visualization": {
+            "title": "Future Self Journey",
+            "full_text": viz_text,
+            "steps": steps,
+            "duration_seconds": len(steps) * 20
+        }
+    }
 
 
 # =============================================
