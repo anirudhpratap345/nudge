@@ -404,9 +404,24 @@ app.add_middleware(
 )
 
 # Mount static files directory (for serving frontend)
-static_dir = os.path.join(os.path.dirname(__file__), "nudge-agent", "static")
-if os.path.exists(static_dir):
+# Try multiple paths: container (./static), local dev (nudge-agent/static), or parent (../nudge-agent/static)
+static_paths = [
+    os.path.join(os.path.dirname(__file__), "static"),  # Container: ./static
+    os.path.join(os.path.dirname(__file__), "nudge-agent", "static"),  # Local: nudge-agent/static
+    os.path.join(os.path.dirname(__file__), "..", "nudge-agent", "static"),  # Alternative
+]
+
+static_dir = None
+for path in static_paths:
+    if os.path.exists(path):
+        static_dir = path
+        break
+
+if static_dir:
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
+    print(f"✓ Static files mounted from: {static_dir}")
+else:
+    print("⚠ Warning: Static directory not found, static files will not be served")
 
 
 # =============================================
@@ -676,20 +691,52 @@ async def improved_advisor_nudge(
         )
         memory_context = memory.format_memory_context(memories)
         
-        # 2. Build progress summary
+        # 2. FORCED INDECISION DETECTION (Check BEFORE anything else!)
+        dream_lower = request.dream.lower()
+        
+        # Strong indecision signals - check explicitly
+        indecision_signals = [
+            " or ",           # "Meta or quant"
+            " vs ",           # "FAANG vs startup"  
+            "should i",       # "Should I become..."
+            "also ",          # "also thinking"
+            "considering",    # "considering both"
+            "which ",         # "which path"
+            "thinking about", # "thinking about grad school"
+            "between ",       # "between these options"
+        ]
+        
+        has_indecision = any(signal in dream_lower for signal in indecision_signals)
+        
+        if has_indecision:
+            logger.warning(f"⚠️  INDECISION DETECTED for user {request.user_id}: '{request.dream[:60]}...'")
+        
+        # 3. Detect full context state (indecision, shift, or single goal)
+        context_state = _detect_context_state(request.dream, memories)
+        # Override with our explicit detection
+        if has_indecision:
+            context_state["has_indecision"] = True
+            context_state["state"] = "indecision"
+        
+        logger.info(f"User {request.user_id} context state: {context_state['state']}, indecision={context_state['has_indecision']}")
+        
+        # 4. Generate appropriate visualization title
+        visualization_title = _generate_visualization_title(request.dream, context_state)
+        logger.info(f"User {request.user_id} visualization title: {visualization_title}")
+        
+        # 5. Build progress summary
         progress_summary = _build_progress_summary(request.progress)
         
-        # 3. Extract/format personality
+        # 6. Extract/format personality
         personality_traits = _extract_personality(
             request.personality,
             memories
         )
         
-        # 3.5. Get deep personality profile from memory
+        # 6.5. Get deep personality profile from memory
         try:
             personality_profile = memory.get_personality_profile(request.user_id)
             if personality_profile and personality_profile.get("status") != "new_user":
-                # Merge profile insights into traits
                 if personality_profile.get("energy_patterns"):
                     personality_traits["energy_pattern"] = personality_profile["energy_patterns"]
                 if personality_profile.get("communication_preference"):
@@ -702,22 +749,64 @@ async def improved_advisor_nudge(
         # Format personality traits as string for prompt
         personality_str = ", ".join([f"{k}: {v}" for k, v in personality_traits.items()]) if personality_traits else "exploring preferences"
         
-        # 4. Build McKenna prompt
+        # 7. Build McKenna prompt with personality AND context adaptation
         from datetime import datetime
         try:
             import pytz
             ist = pytz.timezone('Asia/Kolkata')
             today_date = datetime.now(ist).strftime("%A, %B %d, %Y")
         except ImportError:
-            # Fallback if pytz not installed
             today_date = datetime.now().strftime("%A, %B %d, %Y")
+        
+        # Extract energy_level and preferred_style
+        energy_level = request.personality.get("energy_level", "moderate") if request.personality else "moderate"
+        preferred_style = request.personality.get("preferred_style", "balanced") if request.personality else "balanced"
+        
+        logger.info(f"User {request.user_id}: dream='{request.dream[:50]}...', energy={energy_level}, style={preferred_style}")
+        
+        # 8. BUILD CONTEXT STATE DESCRIPTION WITH CRITICAL OVERRIDE FOR INDECISION
+        if has_indecision or context_state.get("has_indecision"):
+            # Extract the options being compared
+            options = context_state.get("options", [])
+            options_str = " vs ".join(options) if options else "multiple options"
+            
+            context_state_description = f"""
+
+🚨🚨🚨 CRITICAL OVERRIDE - INDECISION DETECTED 🚨🚨🚨
+
+THE USER IS EXPRESSING INDECISION / EXPLORING MULTIPLE OPTIONS.
+They are considering: {options_str}
+
+YOU MUST:
+1. ✅ Start visualization title with "Exploring:" (e.g., "Exploring: {options_str}")
+2. ✅ Address ALL options they mentioned (don't pick one)
+3. ✅ Provide a comparison/decision framework in nudge (pros/cons table, decision matrix)
+4. ✅ Acknowledge uncertainty in visualization ("standing at a crossroads...")
+
+YOU MUST NOT:
+❌ Treat this as a single goal
+❌ Push toward one option and ignore others
+❌ Give a generic nudge like "make a commit" 
+❌ Use title starting with "Journey to:"
+
+Current user state: EXPLORING / UNDECIDED
+Options being considered: {options_str}
+
+CORRECT NUDGE EXAMPLE: "Create a 2-column comparison table for your options. List 3 pros for each. Set a 10-minute timer."
+"""
+        else:
+            context_state_description = context_state.get("description", "Focus on this single, clear goal.")
         
         mckenna_prompt = MCKENNA_SYSTEM_PROMPT.format(
             dream=request.dream,
             progress_summary=progress_summary,
             personality_traits=personality_str,
             memory_context=memory_context if memory_context else "(No memories yet - this is a new user)",
-            today_date=today_date
+            today_date=today_date,
+            energy_level=energy_level,
+            preferred_style=preferred_style,
+            context_state=context_state_description,
+            visualization_title=visualization_title
         )
         
         # 5. Format conversation history if provided
@@ -751,14 +840,18 @@ async def improved_advisor_nudge(
                 response = llm.client.chat.completions.create(
                     model=llm.settings.groq_model,
                     messages=messages,
-                    temperature=0.4,  # Slightly higher for creative visualization
-                    max_tokens=400,   # More tokens for visualization
-                    top_p=0.8
+                    temperature=0.7,  # Higher for more varied, creative responses
+                    max_tokens=600,   # More tokens for full visualization
+                    top_p=0.9
                 )
                 response_text = response.choices[0].message.content
+                logger.info(f"LLM response for {request.user_id}: {response_text[:100]}...")
             except Exception as e:
                 logger.error(f"Groq API error in improved_advisor_nudge: {e}")
-                response_text = "NUDGE: Open your project and make one small commit. VISUALIZATION: Close your eyes. Feel your breath slowing. See yourself as the engineer who ships daily."
+                # Dynamic fallback based on dream, personality, AND context state
+                fallback_nudge = _generate_fallback_nudge(request.dream, energy_level, context_state)
+                fallback_viz = _generate_fallback_visualization(request.dream, energy_level)
+                response_text = f"NUDGE: {fallback_nudge}\n\nVISUALIZATION: {fallback_viz}"
         else:
             # Fallback: use regular generate method
             response_text = llm.generate(
@@ -770,17 +863,23 @@ async def improved_advisor_nudge(
         # 7. Parse into nudge + visualization
         parsed = _parse_mckenna_response(response_text)
         
-        # 8. Generate structured visualization (enhanced version)
+        # 8. Generate structured visualization (enhanced version) - pass energy/style and context-aware title
         try:
+            # Ensure energy and style are in personality_traits for visualization
+            viz_personality = personality_traits.copy()
+            viz_personality["energy"] = energy_level
+            viz_personality["style"] = preferred_style
+            viz_personality["context_state"] = context_state.get("state", "single_goal")
+            
             structured_viz = generate_structured_visualization(
                 dream=request.dream,
-                personality=personality_traits,
+                personality=viz_personality,
                 llm=llm
             )
             
-            # Merge structured visualization into parsed response
+            # Use the context-aware visualization title instead of default
             parsed["visualization"] = {
-                "title": structured_viz["title"],
+                "title": visualization_title,  # Use context-aware title!
                 "phases": structured_viz["phases"],
                 "steps": structured_viz["steps"],
                 "full_text": structured_viz["full_text"],
@@ -790,11 +889,11 @@ async def improved_advisor_nudge(
             logger.warning(f"Failed to generate structured visualization, using parsed version: {e}")
             # Continue with parsed visualization if structured generation fails
         
-        # 9. Store interaction in memory
+        # 9. Store interaction in memory (store nudge only, not dream to avoid pollution)
         try:
             memory.store_memory(
                 user_id=request.user_id,
-                content=f"Dream: {request.dream}. Nudge: {parsed['nudge']}",
+                content=f"Coaching session: Received nudge '{parsed['nudge'][:100]}...'",
                 memory_type="coaching"
             )
         except Exception as e:
@@ -866,31 +965,61 @@ def generate_structured_visualization(
 ) -> dict:
     """
     Generate a structured McKenna-style visualization with specific phases.
-    
-    Creates a 90-second guided visualization with 4 distinct phases:
-    1. GROUND (15s): Breath awareness, present moment
-    2. IMAGINE (30s): Vivid sensory details of achieving the dream
-    3. EMBODY (30s): Feel the identity shift - "I AM this person"
-    4. COMMIT (15s): One small action to take today
+    ADAPTS to energy_level and preferred_style for unique, personalized output.
     """
+    # Extract personality for tone adaptation
+    energy_level = personality.get("energy", personality.get("energy_level", "moderate"))
+    preferred_style = personality.get("style", personality.get("preferred_style", "balanced"))
     personality_str = ", ".join([f"{k}: {v}" for k, v in personality.items()]) if personality else "exploring preferences"
     
-    viz_prompt = f"""Create a 90-second guided visualization for this dream: {dream}
+    # Build adaptive instructions based on energy level
+    if energy_level == "low":
+        tone_instruction = """
+TONE: Gentle, calming, nurturing. Use soft language:
+- "Gently allow yourself to...", "Softly notice...", "Let yourself drift into..."
+- Slower pace, more grounding, permission-giving language
+- Avoid: "surge", "power", "unstoppable", aggressive language"""
+    elif energy_level == "high":
+        tone_instruction = """
+TONE: Energetic, dynamic, powerful. Use vibrant language:
+- "Feel the surge of...", "You're unstoppable...", "Tap into your fire..."
+- Fast-paced, action-oriented, empowering
+- Use: "Launch", "Conquer", "Dominate", "Crush it" """
+    else:
+        tone_instruction = """
+TONE: Balanced, confident, warm. Use clear language:
+- "Notice...", "Feel...", "See yourself..."
+- Steady pace, mix of grounding and action"""
+    
+    # Build style instructions
+    if preferred_style == "gentle":
+        style_instruction = "Be warm and nurturing. Use invitations, not commands. More imagery, less instruction."
+    elif preferred_style == "direct":
+        style_instruction = "Be concise and action-focused. Clear commands. Skip excessive imagery."
+    else:
+        style_instruction = "Balance warmth with clarity. Brief grounding, then clear visualization."
+    
+    viz_prompt = f"""Create a 90-second guided visualization SPECIFICALLY for this dream: {dream}
+
+CRITICAL: This visualization must be UNIQUE to the dream "{dream}" - reference specific elements of this goal.
+
+{tone_instruction}
+
+Style: {style_instruction}
 
 Structure it in 4 phases:
-1. GROUND (15s): Breath awareness, present moment
-2. IMAGINE (30s): Vivid sensory details of achieving the dream
-3. EMBODY (30s): Feel the identity shift - "I AM this person"
-4. COMMIT (15s): One small action to take today
+1. GROUND (15s): Breath awareness, present moment anchoring
+2. IMAGINE (30s): Vivid sensory details of achieving "{dream}" specifically - what do they see, hear, feel?
+3. EMBODY (30s): Identity shift - "I AM the person who has {dream}" - use present tense
+4. COMMIT (15s): One immediate micro-action toward "{dream}"
 
-Use McKenna's language: sensory-rich, present tense, repetitive affirmations.
-
-Personality context: {personality_str}
-
-Format each phase on a new line starting with the phase name (e.g., "GROUND: ...")."""
+Format each phase on a new line: "PHASE_NAME: [content]"
+Make it UNIQUE to this specific dream and energy level."""
 
     # Use LLM to generate visualization
-    system_prompt = "You are Paul McKenna's AI assistant, expert in hypnotic visualization. Create sensory-rich, transformative visualizations."
+    system_prompt = f"""You are Paul McKenna's AI assistant. Create a sensory-rich visualization.
+CRITICAL: The dream is "{dream}" - make the visualization SPECIFIC to this exact goal.
+Energy level is {energy_level}. Adapt your language accordingly."""
     
     # Build messages for Groq API
     if hasattr(llm, 'client'):
@@ -903,25 +1032,17 @@ Format each phase on a new line starting with the phase name (e.g., "GROUND: ...
             response = llm.client.chat.completions.create(
                 model=llm.settings.groq_model,
                 messages=messages,
-                temperature=0.5,  # Higher for creative visualization
-                max_tokens=300,
-                top_p=0.8
+                temperature=0.8,  # Higher for unique, creative visualizations
+                max_tokens=400,
+                top_p=0.9
             )
             viz_response = response.choices[0].message.content
         except Exception as e:
             logger.error(f"Error generating visualization: {e}")
-            # Fallback visualization
-            viz_response = """GROUND: Close your eyes. Take three deep breaths. Feel your body relaxing with each exhale.
-IMAGINE: See yourself achieving your dream. Notice the details around you. Hear the sounds. Feel the confidence.
-EMBODY: You ARE the person who has achieved this. Feel this identity in your bones. This is who you are becoming.
-COMMIT: Open your eyes. Take one small action today that moves you closer to this reality."""
+            # Dynamic fallback based on dream and energy
+            viz_response = _generate_fallback_visualization(dream, energy_level)
     else:
-        # Fallback: use regular generate
-        viz_response = llm.generate(
-            user_message=viz_prompt,
-            memory_context="",
-            conversation_history=""
-        )
+        viz_response = _generate_fallback_visualization(dream, energy_level)
     
     # Parse phases
     phases = {}
@@ -933,24 +1054,15 @@ COMMIT: Open your eyes. Take one small action today that moves you closer to thi
             continue
         for phase in phase_order:
             if line.upper().startswith(phase):
-                # Extract text after phase name
                 phase_text = line.split(":", 1)[1].strip() if ":" in line else line.replace(phase, "").strip()
                 phases[phase] = phase_text
                 break
     
-    # Fill in missing phases with fallbacks
-    fallbacks = {
-        "GROUND": "Close your eyes. Take three deep breaths. Feel your body relaxing with each exhale.",
-        "IMAGINE": "See yourself achieving your dream. Notice the details around you. Hear the sounds. Feel the confidence.",
-        "EMBODY": "You ARE the person who has achieved this. Feel this identity in your bones. This is who you are becoming.",
-        "COMMIT": "Open your eyes. Take one small action today that moves you closer to this reality."
-    }
-    
+    # Fill missing phases with DYNAMIC fallbacks that use the dream
     for phase in phase_order:
         if phase not in phases:
-            phases[phase] = fallbacks[phase]
+            phases[phase] = _get_dynamic_phase_fallback(phase, dream, energy_level)
     
-    # Create steps from phases
     steps = [
         {"text": phases["GROUND"], "duration_seconds": 15},
         {"text": phases["IMAGINE"], "duration_seconds": 30},
@@ -965,6 +1077,288 @@ COMMIT: Open your eyes. Take one small action today that moves you closer to thi
         "total_duration": 90,
         "full_text": viz_response
     }
+
+
+def _detect_context_state(dream: str, memories: list = None) -> dict:
+    """
+    Detect the user's context state: indecision, context shift, or single goal.
+    Returns context info for prompt and visualization title.
+    """
+    dream_lower = dream.lower()
+    
+    # Indecision signals
+    indecision_signals = ["or", " vs ", "also", "thinking about", "should i", "considering", "between", "either"]
+    has_indecision = any(signal in dream_lower for signal in indecision_signals)
+    
+    # Extract options if indecision detected
+    options = []
+    if has_indecision:
+        # Try to extract the options being compared
+        for splitter in [" or ", " vs ", " between "]:
+            if splitter in dream_lower:
+                parts = dream_lower.split(splitter)
+                options = [p.strip()[:40] for p in parts if len(p.strip()) > 3]
+                break
+        
+        # If "also" or "thinking about", extract what they're considering
+        if not options and ("also" in dream_lower or "thinking" in dream_lower):
+            options = ["current path", "new option being considered"]
+    
+    # Context shift detection (if memories exist)
+    context_shift = False
+    prev_focus = None
+    if memories and len(memories) > 0:
+        prev_content = " ".join([str(m.get("content", m.get("text", "")))[:100] for m in memories[:3]]).lower()
+        
+        # Extract key words from current dream and memories
+        dream_words = set(w for w in dream_lower.split() if len(w) > 3)
+        memory_words = set(w for w in prev_content.split() if len(w) > 3)
+        
+        # If current dream has many new words not in memories, it's likely a shift
+        new_words = dream_words - memory_words
+        if len(new_words) > 5:
+            context_shift = True
+            # Try to identify what the previous focus was
+            if "faang" in prev_content or "leetcode" in prev_content or "interview" in prev_content:
+                prev_focus = "FAANG prep"
+            elif "startup" in prev_content or "launch" in prev_content or "saas" in prev_content:
+                prev_focus = "startup launch"
+            elif "engineer" in prev_content or "developer" in prev_content:
+                prev_focus = "engineering career"
+            else:
+                prev_focus = "previous goal"
+    
+    # Determine state
+    if has_indecision:
+        state = "indecision"
+        state_description = f"""
+CRITICAL CONTEXT: User is in EXPLORATION/INDECISION mode.
+They are considering multiple options: {', '.join(options) if options else 'multiple paths'}
+
+DO NOT:
+- Just pick one option and ignore the others
+- Repeat a single goal as if they've decided
+- Give a generic "make a commit" type nudge
+
+DO:
+- Help them COMPARE their options
+- Provide a decision-making framework
+- Suggest creating a pros/cons table or talking to people in each field
+- Acknowledge that exploration is valid
+"""
+    elif context_shift and prev_focus:
+        state = "context_shift"
+        state_description = f"""
+CRITICAL CONTEXT: User's focus has SHIFTED from their previous context.
+Previous focus was: {prev_focus}
+Current message indicates: {dream[:60]}
+
+Address their CURRENT state. The previous context is just background.
+If appropriate, acknowledge the transition.
+"""
+    else:
+        state = "single_goal"
+        state_description = "Focus on this single, clear goal."
+    
+    return {
+        "state": state,
+        "description": state_description,
+        "has_indecision": has_indecision,
+        "options": options,
+        "context_shift": context_shift,
+        "prev_focus": prev_focus
+    }
+
+
+def _generate_visualization_title(dream: str, context_state: dict) -> str:
+    """Generate an appropriate visualization title based on context state."""
+    state = context_state.get("state", "single_goal")
+    
+    if state == "indecision":
+        options = context_state.get("options", [])
+        if len(options) >= 2:
+            return f"Exploring: {options[0].title()} vs {options[1].title()}"
+        else:
+            return f"Exploring: Your Options and Possibilities"
+    
+    elif state == "context_shift":
+        prev_focus = context_state.get("prev_focus", "previous path")
+        # Extract current focus from dream
+        current_focus = dream[:35].strip()
+        return f"Transitioning: {prev_focus} → {current_focus}"
+    
+    else:
+        # Single goal - clean it up for title
+        clean_dream = dream[:50].strip()
+        return f"Journey to: {clean_dream}"
+
+
+def _generate_fallback_nudge(dream: str, energy_level: str, context_state: dict = None) -> str:
+    """
+    Generate context-aware fallback nudges based on:
+    1. Context state (indecision, shift, single goal)
+    2. Keywords in dream (career, FAANG, transition, launch, etc.)
+    3. Indecision signals (or, also, thinking, should I)
+    4. Energy level (low/moderate/high)
+    """
+    dream_lower = dream.lower()
+    
+    # CATEGORY 0: Indecision / Exploration (highest priority)
+    if context_state and context_state.get("has_indecision"):
+        options = context_state.get("options", [])
+        if options:
+            action = f"Create a 2-column comparison: '{options[0][:20]}' vs '{options[1][:20] if len(options) > 1 else 'option 2'}'. List 3 pros for each. Takes 10 minutes."
+        else:
+            action = "Open a notes app and create a decision matrix: List your options as columns, then add rows for 'daily work', 'growth potential', 'lifestyle impact'. Score each 1-5."
+        
+        if energy_level == "low":
+            return f"Gently explore your options: {action}"
+        elif energy_level == "high":
+            return f"Let's get clarity! {action}"
+        else:
+            return f"Time for clarity: {action}"
+    
+    # CATEGORY 1: FAANG / Tech Interviews
+    faang_keywords = ["meta", "google", "faang", "leetcode", "interview", "amazon", "apple", "microsoft", "netflix"]
+    if any(kw in dream_lower for kw in faang_keywords):
+        actions = [
+            "Open LeetCode and solve problem #1 (Two Sum) with optimal solution. Time yourself: 15 minutes max.",
+            "Open a Google Doc and write 3 bullet points explaining how you'd design a URL shortener (system design prep).",
+            "Search 'Meta software engineer interview questions' and read through the top 3 Glassdoor posts. Note 2 common themes."
+        ]
+        action = actions[hash(dream) % len(actions)]
+    
+    # CATEGORY 2: Startup / Launch / Product
+    elif any(kw in dream_lower for kw in ["startup", "launch", "saas", "product", "customer", "mvp", "ship"]):
+        actions = [
+            "Open your project and ship ONE small improvement - even a typo fix counts. Push it live.",
+            "Create a file called 'launch-checklist.md' and write 5 things needed before first customer. Pick the smallest one.",
+            "Open Twitter/X and write a tweet describing your product in one sentence. Don't post yet - just draft it."
+        ]
+        action = actions[hash(dream) % len(actions)]
+    
+    # CATEGORY 3: Career Transition
+    elif any(kw in dream_lower for kw in ["become", "transition", "switch to", "move to", "career change", "from", "to"]):
+        actions = [
+            "Open LinkedIn and find 3 people in your target role. Note what skills they highlight in their profiles.",
+            "Search YouTube for 'day in the life of [your target role]'. Watch one video (10 min) and note 2 surprises.",
+            "Create a 'skills gap' list: Write 3 skills you have, 3 you need for the target role. Circle the easiest to learn."
+        ]
+        action = actions[hash(dream) % len(actions)]
+    
+    # CATEGORY 4: Burnout / Recovery / Low Energy
+    elif any(kw in dream_lower for kw in ["burned out", "burnt out", "tired", "exhausted", "overwhelmed", "stuck", "lost", "energy"]):
+        actions = [
+            "Step away from screen for 5 minutes. Walk to window, take 10 slow breaths. Then write ONE tiny task you can do today.",
+            "Open your task list and DELETE 3 things that don't actually matter this week. Feel the relief.",
+            "Set a timer for 10 minutes. Do ONE small task - anything. When timer rings, you're done. No guilt."
+        ]
+        action = actions[hash(dream) % len(actions)]
+    
+    # CATEGORY 5: Skill Building / Learning
+    elif any(kw in dream_lower for kw in ["learn", "master", "improve", "practice", "study", "course", "tutorial"]):
+        actions = [
+            "Open YouTube and search for a 10-minute tutorial on your target skill. Watch it actively - pause and try things.",
+            "Create a 'learning log' file. Write today's date and ONE concept you want to understand better. Add notes as you learn.",
+            "Find one code example or tutorial and type it out yourself (don't copy-paste). Understanding comes through fingers."
+        ]
+        action = actions[hash(dream) % len(actions)]
+    
+    # CATEGORY 6: General Engineering / Coding
+    elif any(kw in dream_lower for kw in ["engineer", "developer", "coding", "programming", "software", "code"]):
+        actions = [
+            "Open your IDE and write or review 10 lines of code. Doesn't matter what - just touch the code.",
+            "Pick one function in your codebase. Add one comment explaining what it does. Or improve one variable name.",
+            "Open GitHub and star one repo related to your goals. Skim the README. Note one thing you could learn from it."
+        ]
+        action = actions[hash(dream) % len(actions)]
+    
+    # CATEGORY 7: Quant / Finance / Trading
+    elif any(kw in dream_lower for kw in ["quant", "trading", "finance", "hedge fund", "algo", "quantitative"]):
+        actions = [
+            "Open a Python notebook and import pandas. Load any stock data (yfinance) and calculate a simple moving average.",
+            "Search 'quant developer interview questions' and read through 3. Note which math concepts keep appearing.",
+            "Find one quantitative finance blog (QuantStart, Quantopian) and read one recent article. Note one new concept."
+        ]
+        action = actions[hash(dream) % len(actions)]
+    
+    # DEFAULT: Generic but still actionable
+    else:
+        action = f"Open a notes app and write: 'My next concrete step toward {dream[:25]}... is [blank]'. Fill in the blank with something you can do in 10 minutes."
+    
+    # Energy level adaptation
+    if energy_level == "low":
+        prefix = "Gently, when you're ready: "
+        suffix = " No pressure - even starting counts."
+    elif energy_level == "high":
+        prefix = "Let's GO! "
+        suffix = " You've got this!"
+    else:
+        prefix = "Here's your 10-minute action: "
+        suffix = ""
+    
+    return f"{prefix}{action}{suffix}"
+
+
+def _generate_fallback_visualization(dream: str, energy_level: str) -> str:
+    """Generate a dynamic fallback visualization based on dream and energy."""
+    if energy_level == "low":
+        ground = "Close your eyes. Allow three gentle breaths. Feel the weight of your body settling. You are safe here."
+        imagine = f"Softly, see yourself having achieved '{dream[:40]}'. Notice how calm and peaceful you feel. The struggle is behind you."
+        embody = f"Whisper to yourself: 'I am becoming this person.' Feel the gentle truth of it. This is who you are growing into."
+        commit = "When ready, open your eyes. Take one tiny step. Even small movements matter."
+    elif energy_level == "high":
+        ground = "Take a powerful breath. Feel your energy rising. You're READY for this."
+        imagine = f"SEE yourself crushing '{dream[:40]}'! Feel that surge of victory! You're unstoppable!"
+        embody = f"You ARE the person who achieves this! Feel it in your bones! This is your DESTINY!"
+        commit = "Open your eyes and MOVE! Take one action RIGHT NOW toward your dream!"
+    else:
+        ground = "Close your eyes. Take three deep breaths. Feel your body relaxing, your mind clearing."
+        imagine = f"See yourself achieving '{dream[:40]}'. Notice the details - what you see, hear, feel. You're there."
+        embody = f"You ARE becoming this person. Feel this identity settling into your bones. This is who you are."
+        commit = "Open your eyes. Take one clear action today that moves you toward this reality."
+    
+    return f"""GROUND: {ground}
+IMAGINE: {imagine}
+EMBODY: {embody}
+COMMIT: {commit}"""
+
+
+def _get_dynamic_phase_fallback(phase: str, dream: str, energy_level: str) -> str:
+    """Get a dynamic fallback for a specific phase."""
+    if phase == "GROUND":
+        if energy_level == "low":
+            return "Gently close your eyes. Let three soft breaths release any tension. You are safe and supported."
+        elif energy_level == "high":
+            return "Take a powerful breath! Feel your energy rising! You're about to visualize your victory!"
+        else:
+            return "Close your eyes. Breathe deeply three times. Feel yourself becoming present, grounded, ready."
+    
+    elif phase == "IMAGINE":
+        if energy_level == "low":
+            return f"Softly picture yourself having achieved '{dream[:35]}'. Feel the peaceful satisfaction. See how far you've come."
+        elif energy_level == "high":
+            return f"VIVIDLY see yourself CRUSHING '{dream[:35]}'! Feel that rush of triumph! You made it happen!"
+        else:
+            return f"See yourself achieving '{dream[:35]}'. Notice every detail - what you see, hear, feel. You're living it."
+    
+    elif phase == "EMBODY":
+        if energy_level == "low":
+            return f"Gently repeat: 'I am becoming this person.' Let this truth settle softly into your heart."
+        elif energy_level == "high":
+            return f"Say it with POWER: 'I AM this person!' Feel unstoppable confidence surge through you!"
+        else:
+            return f"Feel yourself becoming this person. Your identity is shifting. This is who you ARE now."
+    
+    elif phase == "COMMIT":
+        if energy_level == "low":
+            return "When ready, gently open your eyes. Choose one small step you can take today. Even tiny progress counts."
+        elif energy_level == "high":
+            return "OPEN YOUR EYES! You're on FIRE! Take one bold action RIGHT NOW! GO!"
+        else:
+            return "Open your eyes with calm confidence. Take one clear action today toward your dream."
+    
+    return f"Focus on {dream[:30]} and take one step forward."
 
 
 def _parse_mckenna_response(response: str) -> dict:
@@ -1088,21 +1482,41 @@ async def get_system_prompt():
 @app.get("/", response_class=HTMLResponse, tags=["Root"])
 async def root():
     """Serve the frontend HTML at root URL."""
-    static_dir = os.path.join(os.path.dirname(__file__), "nudge-agent", "static")
-    index_path = os.path.join(static_dir, "index.html")
+    # Try multiple paths to find index.html
+    index_paths = [
+        os.path.join(os.path.dirname(__file__), "static", "index.html"),  # Container: ./static/index.html
+        os.path.join(os.path.dirname(__file__), "nudge-agent", "static", "index.html"),  # Local: nudge-agent/static/index.html
+        os.path.join(os.path.dirname(__file__), "..", "nudge-agent", "static", "index.html"),  # Alternative
+    ]
     
-    if os.path.exists(index_path):
+    index_path = None
+    for path in index_paths:
+        if os.path.exists(path):
+            index_path = path
+            break
+    
+    if index_path:
+        print(f"✓ Serving index.html from: {index_path}")
         return FileResponse(index_path)
     else:
         # Fallback to API info if static file not found
+        print("⚠ Warning: index.html not found, serving fallback")
         return HTMLResponse("""
         <html>
-            <head><title>Nudge Coach API</title></head>
+            <head>
+                <title>Nudge Coach API</title>
+                <style>
+                    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 40px; text-align: center; }
+                    a { color: #007AFF; text-decoration: none; }
+                    a:hover { text-decoration: underline; }
+                </style>
+            </head>
             <body>
                 <h1>Nudge Coach API</h1>
                 <p>Version 1.0.0</p>
                 <p><a href="/docs">API Documentation</a></p>
                 <p><a href="/api/v1/health">Health Check</a></p>
+                <p style="color: #86868B; margin-top: 40px;">Static files not found. Check Dockerfile and file paths.</p>
             </body>
         </html>
         """)
